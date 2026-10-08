@@ -6,7 +6,9 @@ min_enclosure
 =============
 
 Every shape on the enclosed layer (``layers[1]``) must sit inside an enclosing region
-(``layers[0]``) with at least ``value`` µm of margin on **all** sides.
+(``layers[0]``) with at least ``value`` µm of margin — on all sides, or on the sides
+``sides`` names: at least one (a wire's endcap round a via), the sides bordering a short
+one, or the side facing a narrow track's tip.
 
 
 Semantics
@@ -19,6 +21,14 @@ parallel outer edges that have positive projected overlap onto it (KLayout's
 among those pairs is the shape's measured enclosure. A shape not contained by any
 enclosing region is itself a violation ("not enclosed at all") unless ``interacting_only``
 says otherwise.
+
+The measurement is exact on the grid: the coordinates are integers, so a margin between
+parallel walls is a ratio of two integers and one read at a chamfer under the
+``euclidian`` metric is compared squared as one, against ``value`` rounded up to whole
+DBU once. Whether a vertex is inside, on or off the enclosing contour is a matter of
+signs, never of a tolerance. The one reading that is not exact is the per-side margin
+``sides: adjacent`` takes off a wall at another angle than the side, found by
+interpolation.
 
 An inner edge that lies exactly on the enclosing contour — a *coincident* segment, offset
 ~0 — is geometrically ambiguous: it's either a genuinely flush 0-margin violation, or an
@@ -56,6 +66,57 @@ Two layers, positional:
 Parameters
 ----------
 
+``sides``
+   Optional. Which sides of the enclosed shape have to make the margin. All four read
+   the same per-side margins and differ only in the verdict.
+
+   ``all`` (the default)
+      Every side: the worst side must reach ``value``.
+
+   ``any``
+      At least one side: the *best* side must reach ``value`` — the wire endcap. A via
+      at a metal corner is an endcap on one side, with the ordinary rule at a much
+      smaller value covering the rest (IHP ``V1.c`` at 0.01 µm alongside ``V1.c1`` at
+      0.05 µm with ``sides: any``: mostly flush is fine, but one side needs real
+      margin). The margin is the enclosing region's bounding-box margin on each side,
+      deliberately: an edge-to-contour distance is corner-limited and would understate
+      a long endcap run.
+
+   ``adjacent``
+      A side enclosed by less than ``trigger`` is allowed only if the sides bordering it
+      reach ``value`` (GF180 ``S.CO.6_ii``: a contact may sit flush on one side when the
+      two sides next to it have the full margin).
+
+   ``line_end``
+      Only the side facing a *line end* of the enclosing layer — the cap across the tip
+      of a track narrower than ``max_width`` that runs for at least ``min_length``
+      (GF180 ``CO.6a``). This is the one mode whose condition comes from the enclosing
+      layer's own shape: a narrow line's tip pulls back during processing, so metal that
+      merely reaches the via on paper may not reach it on silicon. The sidewalls are the
+      ordinary rule's business.
+
+``metric``
+   Optional. ``projection`` (the default) pairs each inner edge with the parallel outer
+   edges that project onto it; ``euclidian`` reads the closest approach, which is
+   KLayout's own default. The two agree on orthogonal geometry and part company at any
+   corner that is not square.
+
+``over`` (a ``layer_params`` entry)
+   Optional. Only a pair whose margin lies over that layer counts - read just outside
+   the inner wall, so a wall flush with the layer's own edge has no margin to read -
+   KLayout's ``.ext_and(layer)`` on a margin read. IHP's ``TGO.c`` reads the gate to the
+   thick oxide's edge where that edge crosses the Activ (``over: Activ``); the oxide's
+   edge past the Activ's end is ``TGO.a``'s, and an Activ ending inside the oxide has no
+   oxide edge over it at all.
+
+``trigger``
+   With ``sides: adjacent``: the margin below which a side starts asking something of
+   the sides bordering it.
+
+``max_width`` / ``min_length``
+   With ``sides: line_end``: what counts as a narrow track, and how far it must run
+   before it is a line rather than a notch.
+
 ``interacting_only``
    Off by default (every enclosed shape must be fully inside some enclosing region, or
    it's a violation). When set, a shape that overlaps no enclosing region at all is out
@@ -63,7 +124,13 @@ Parameters
    ``enclosed`` only checking shapes that actually interact with the enclosing layer (a
    via nowhere near a MIM cap isn't "a MIM via" to begin with). A shape that *partially*
    overlaps an enclosing region is still measured, using only the facing pairs on its
-   contained side.
+   contained side — which is what an *extension* rule is: a cover that must reach past
+   the target it crosses by so much, measured on the target's walls under the cover
+   and not on the ends that run out past it (IHP ``Gat.c``, the poly endcap over
+   Activ; ``Sal.c``, the salicide block over the active it crosses). The rule's
+   ``metric`` applies here as anywhere: under ``euclidian`` a chamfered endcap is read
+   at its corner, and a corner the tile's cut made is read on the whole wall or left to
+   the tile past it, never taken for a corner of the shape.
 
 ``skip_coincident``
    Off by default. Ignore inner/outer edge pairs that are coincident (flush, ~0 offset)
@@ -81,9 +148,18 @@ Violation markers
 
 - Fully unenclosed shape (no ``interacting_only``): one point marker at the shape's
   centroid.
-- Contained (or, under ``interacting_only``, partially overlapping) shape whose measured
-  margin is below ``value``: one edge marker along the facing outer wall responsible for
-  the worst margin.
+- Contained (or, under ``interacting_only``, partially overlapping) shape with walls
+  short of ``value``: one edge marker per *run* of short walls, at the run's worst
+  margin. Walls that meet at a corner are one run, so a shape short on one side or on
+  two adjacent sides is one marker, a shape short on two opposite sides two, and a comb
+  short at three fingers three; a ring short all the way round is one run for its
+  outer boundary and one for its hole. KLayout reports an edge pair per wall.
+- Under ``sides: any`` and for :doc:`max_enclosure`, which read the shape as a whole,
+  one marker per shape; under ``sides: any`` it sits on the shape's first contour
+  edge, since the bounding-box reduction names no single wall.
+
+A shape is read as one whole whatever the tiling: a shape spanning several tiles is put
+together from its pieces, and the count does not move with the tile size.
 
 
 KLayout equivalent
@@ -92,6 +168,8 @@ KLayout equivalent
 ``inner.enclosed(outer, value, metric: RBA::Region::projection, ...)`` — ``skip_coincident``
 mirrors ``consider_intersecting_edges: false`` / ``without_distance(0)``; ``skip_clipped``
 has no single built-in KLayout flag and is a region-level generalization of the same idea.
+Neither ``sides: any`` nor ``adjacent`` is a single operator; ``line_end`` is the
+``enclosed`` of the via against the enclosing layer's line-end edges alone.
 
 
 Example
@@ -101,7 +179,7 @@ Example
 
     - id: Cnt.c
       check: min_enclosure
-      layers: [Activ, ContOnActivNoSRAM]
+      layers: [Activ, ContOnActivNoSRAMVaricap]
       value: 0.07
 
 .. code-block:: yaml
@@ -126,4 +204,30 @@ Example
       value: 1.30
       params:
         skip_coincident: 1
+        interacting_only: 1
+
+.. code-block:: yaml
+
+    # V1.c allows the via to be nearly flush with Metal1 on most sides; V1.c1 requires a
+    # real endcap on at least one side.
+    - id: V1.c
+      check: min_enclosure
+      layers: [Metal1, Via1NoSealring]
+      value: 0.01
+    - id: V1.c1
+      check: min_enclosure
+      layers: [Metal1, Via1NoSealring]
+      value: 0.05
+      params:
+        sides: any
+
+.. code-block:: yaml
+
+    # Sal.c: SalBlock must extend 0.20 µm past the Activ or GatPoly it crosses; the
+    # target's own ends, outside the block, are not measured.
+    - id: Sal.c
+      check: min_enclosure
+      layers: [SalBlock, ActivOrGatPoly]
+      value: 0.20
+      params:
         interacting_only: 1

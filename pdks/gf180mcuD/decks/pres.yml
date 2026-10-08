@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# P+ poly resistor.  All 9 rules in this section.
+#
+rules:
+  - id: PRES.1
+    check: min_width
+    layers: [pres_poly]
+    value: 0.8
+  - id: PRES.2
+    check: min_space
+    layers: [pres_poly]
+    value: 0.4
+  - id: PRES.2
+    check: min_notch
+    layers: [pres_poly]
+    value: 0.4
+  # A COMP sharing an edge with the resistor has a space of nothing between them, and
+  # nothing is under 0.6; the overlap half wants area and never saw it (reports, finding
+  # 2).  Upstream's `comp.not_outside(pres_poly)` keeps the touch the same way.
+  - id: PRES.3
+    check: min_space
+    layers: [pres_poly, comp]
+    value: 0.6
+    params:
+      abutting: report
+  - id: PRES.3
+    check: forbidden
+    layers: [comp_on_pres]
+    value: 0.0
+  - id: PRES.4
+    check: min_space
+    layers: [pres_poly, poly2_unrelated]
+    value: 0.6
+  - id: PRES.5
+    check: min_enclosure
+    layers: [pplus, pres_poly]
+    value: 0.3
+    params:
+      interacting_only: 1
+  - id: PRES.5
+    check: forbidden
+    layers: [pres_5_crossing]
+    value: 0.0
+  - id: PRES.6
+    check: min_enclosure
+    layers: [sab, pres_poly]
+    value: 0.28
+    params:
+      interacting_only: 1
+  - id: PRES.7
+    check: min_space
+    layers: [cont_pres, sab]
+    value: 0.22
+  - id: PRES.7
+    check: forbidden
+    layers: [cont_pres_on_sab]
+    value: 0.0
+  - id: PRES.9a
+    check: forbidden
+    layers: [pres9a_viol]
+    value: 0.0
+  - id: PRES.9b
+    check: min_space
+    layers: [res_mk_big, res_mk]
+    value: 20.0

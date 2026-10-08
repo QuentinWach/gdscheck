@@ -16,22 +16,31 @@ rules:
     layers: [Activ]
     value: 0.21
   - id: Act.c
-    check: min_extension
+    check: min_enclosure
     layers: [Activ, GatPoly]
     value: 0.23
+    params:
+      metric: euclidian
+      interacting_only: 1
   - id: Act.d
     check: min_area
     layers: [Activ]
     value: 0.122
+    params:
+      touching: separate
   - id: Act.e
-    check: min_enclosed_area
-    layers: [Activ]
+    check: min_area
+    layers: [ActivHoleEmpty]
     value: 0.15
+    params:
+      touching: separate
 
   - id: AFil.a
     check: max_width
     layers: [Activ.filler]
     value: 5.0
+    params:
+      span: narrowest
   - id: AFil.a1
     check: min_width
     layers: [Activ.filler]
@@ -44,61 +53,103 @@ rules:
     check: min_space
     layers: [Activ.filler, Cont]
     value: 1.10
+    params:
+      abutting: report
   - id: AFil.c
     check: min_space
     layers: [Activ.filler, GatPoly]
     value: 1.10
+    params:
+      abutting: report
   - id: AFil.c1
     check: min_space
     layers: [Activ.filler, Activ]
     value: 0.42
+    params:
+      abutting: report
   - id: AFil.d
     check: min_space
     layers: [Activ.filler, NWell]
     value: 1.00
+    params:
+      abutting: report
+  - id: AFil.d
+    check: min_enclosure
+    layers: [NWell, ActivFillerInNWell]
+    value: 1.00
+    params:
+      metric: euclidian
   - id: AFil.d
     check: min_space
-    layers: [Activ.filler, nBuLay]
+    layers: [Activ.filler, nBuLayDerived]
     value: 1.00
+    params:
+      abutting: report
+  - id: AFil.d
+    check: min_enclosure
+    layers: [nBuLayDerived, ActivFillerInNBuLay]
+    value: 1.00
+    params:
+      metric: euclidian
   - id: AFil.e
     check: min_space
     layers: [Activ.filler, TRANS]
     value: 1.00
+    params:
+      abutting: report
+  - id: AFil.e
+    check: min_enclosure
+    layers: [TRANS, ActivFillerInTRANS]
+    value: 1.00
+    params:
+      metric: euclidian
   - id: AFil.g
     check: min_density
     layers: [Activ, Activ.filler, Activ.mask]
     value: 35.00
-    params:
-      boundary_layer: 39
-      boundary_datatype: 4
+    layer_params:
+      boundary: EdgeSeal.boundary
   - id: AFil.g1
     check: max_density
     layers: [Activ, Activ.filler, Activ.mask]
     value: 55.00
-    params:
-      boundary_layer: 39
-      boundary_datatype: 4
+    layer_params:
+      boundary: EdgeSeal.boundary
   - id: AFil.g2
-    check: min_windowed_density
+    check: min_density
     layers: [Activ, Activ.filler, Activ.mask]
     value: 25.00
     params:
+      scope: window
       window: 800.0
-      boundary_layer: 39
-      boundary_datatype: 4
+      step: 400.0
+    layer_params:
+      boundary: EdgeSeal.boundary
   - id: AFil.g3
-    check: max_windowed_density
+    check: max_density
     layers: [Activ, Activ.filler, Activ.mask]
     value: 65.00
     params:
+      scope: window
       window: 800.0
-      boundary_layer: 39
-      boundary_datatype: 4
+      step: 400.0
+    layer_params:
+      boundary: EdgeSeal.boundary
   - id: AFil.i
     check: min_space
     layers: [Activ.filler, PWell.block]
     value: 1.50
+    params:
+      abutting: report
+  - id: AFil.i
+    check: min_enclosure
+    layers: [PWell.block, ActivFillerWithinPWellBlock]
+    value: 1.50
+    params:
+      metric: euclidian
   - id: AFil.j
     check: min_enclosure
     layers: [nSDBlockAndSalBlock, ActivFillerInPWellBlock]
     value: 0.25
+    params:
+      metric: euclidian

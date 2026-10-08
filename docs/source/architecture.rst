@@ -66,8 +66,9 @@ A tile's halo must be at least as large as the biggest distance any rule measure
 layer, or a shape just across the tile boundary could be missed and a real violation (or
 a real pass) computed wrong at the tile's edge. The halo is **per layer, not per run**:
 before the merge cache is built, ``lib.rs`` scans every distance-based rule (``min_width``,
-``max_width``, ``exact_width``, ``min_space``, ``min_notch``, ``min_enclosure``,
-``max_enclosure``) and records, per layer, the largest ``value`` referencing it. A deck-wide
+``max_width``, ``exact_width``, the gate-length rules, ``min_space``, ``min_notch``,
+``min_enclosure``, ``max_enclosure``) and records, per layer, the largest ``value``
+referencing it. A deck-wide
 halo would let one coarse rule (e.g. a 1500 µm ``max_width`` on a guard layer) inflate the
 merge of every fine layer in the deck — for a dense layer that difference is the
 difference between a normal run and one that never finishes.
@@ -89,30 +90,35 @@ geometry: each tile independently computes the piece of every region that falls 
 whenever their shared core edge shows continuous coverage. A region's aggregate property
 — total area, a representative marker point, or a caller's boolean predicate ("does any
 piece touch layer B") — is then just an OR/sum reduction over its pieces, which stays cheap
-however many tiles a real-world region spans.
+however many tiles a real-world region spans. The ``inside`` selector is the one that
+reduces with AND instead: every piece must be covered, not just one.
 
-This is what lets checks like windowed-density's plate analysis, or the
-``interacting``/``not_interacting``/``with_text`` virtual-layer selectors, run correctly
-on chip-spanning regions while only ever touching tile-local, halo-bounded geometry.
+This is what lets checks like windowed-density's plate analysis, or the region selectors
+behind the ``overlapping``/``interacting``/``inside``/``covering`` virtual layers (and
+``with_text``), run correctly on chip-spanning regions while only ever touching
+tile-local, halo-bounded geometry.
 
 
 Lazy virtual layers
 ---------------------
 
-A PDK's ``virtual_layers:`` (declared in ``pdk.yml``, see :doc:`virtual-ops`) come in two
-evaluation modes:
+A PDK's ``virtual_layers:`` (declared in ``pdk.yml`` as sentences, see
+:doc:`virtual-ops`) are built one of two ways, and which one is decided by the checks
+that read a layer, not declared:
 
-* **Eager** (the default) — computed once, up front, as ordinary boundaries inserted
-  into the flattened layout (``pdk.rs`` → ``compute_virtual_layers``). Fine for small or
-  sparse derived layers.
-* **Lazy** (``mode: lazy``) — registered with the ``MergedCache`` as a ``TiledVirtual``:
-  a synthetic ``(layer, datatype)`` key built per tile, on first ``ensure``, by applying a
-  boolean/selection/morphological op to its source layers' tiles (each recursively
-  ``ensure``\ d in turn). A lazy virtual layer costs nothing until something actually
-  asks for it, and its
-  memory profile is the same tile+halo bound as any drawn layer — the mode a dense,
-  multi-step derivation (like the antenna forbidden-region chain in
-  :doc:`checks/forbidden_unless_labeled`) must use to stay bounded on a full chip.
+* **Lazy** (every layer, unless a rule needs otherwise) — registered with the
+  ``MergedCache`` as a ``TiledVirtual``: a synthetic ``(layer, datatype)`` key built per
+  tile, on first ``ensure``, by applying a boolean/selection/morphological op to its
+  source layers' tiles (each recursively ``ensure``\ d in turn). A lazy virtual layer
+  costs nothing until something actually asks for it, and its memory profile is the
+  same tile+halo bound as any drawn layer — what a dense, multi-step derivation (like
+  the ``AntHError`` chain behind IHP's antenna rule Ant.h) needs to stay bounded on a
+  full chip.
+* **Eager** — computed once, up front, as ordinary boundaries inserted into the
+  flattened layout (``pdk.rs`` → ``compute_virtual_layers``): the layers a whole-layout
+  check (``checks::reads_layout``) reads, and the ones made by ``inside_ring``.
+  ``pdk.rs`` → ``eager_layers`` names them from the rules about to run, and refuses a
+  rule whose layer cannot be built that way before the layout is read.
 
 A lazy virtual layer that feeds another must have its own halo raised to cover the
 downstream layer's needs, transitively — ``lib.rs`` propagates this before the merge cache
@@ -159,3 +165,17 @@ per-window density) fans out across ``rayon``'s thread pool, one task per tile k
 independent (correctness depends only on the halo, not on execution order), this
 parallelism is exact, not an approximation — the result of a threaded run is identical to
 a single-threaded one.
+
+The rules themselves run one after another over the merge cache, which the checks read
+through a lock (``SharedCache``): a call takes the lock for its duration and hands back
+what the cache holds by ``Arc``, so a check computes on its copies outside the lock, and
+a build — a merge, a stitch, a derived layer — runs under the lock on a thread pool of its
+own, so the thread that holds the lock never steals a job that would take it. Up to
+``GDSCHECK_WAVE`` rules (four by default) run side by side on threads of their own,
+admitted against the memory plan (what each rule's layers would add, plus a reserve for
+its working set); a rule that registers derived layers of its own (the ``forbidden``
+family) runs alone. The waves overlap the rules that keep few cores busy outside the
+lock — the density rules of a 4 mm² design took the run from 65 to 58 s — and nothing
+of a rule's time under the lock, which is a build: on the gf180 reference design the
+gain came from composing the edge layers' tiles in parallel instead. ``GDSCHECK_WAVE=1``
+runs the rules one at a time; the result is the same either way.

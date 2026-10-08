@@ -4,7 +4,8 @@
 
 [package]
 name = "gdscheck"
-version = "0.1.2"
+# When bumping: also update the tag in README.md's image URL
+version = "0.2.0"
 edition = "2024"
 authors = ["Daniel Schultz <dnltz@aesc-silicon.de>"]
 description = "Open-source DRC (Design Rule Check) engine for GDSII layouts."
@@ -24,12 +25,31 @@ include = [
 
 [dev-dependencies]
 rstest = "0.23"
+# The pattern tests are one contract each over a thousand layouts; run in a loop they
+# were seven of the gf180mcuD file's thirteen seconds, on one core while thirty-one
+# waited.
+rayon = "1"
+
+# The tests run optimized: the suite is geometry over two thousand layouts at three
+# tile sizes, and unoptimized it took the CI runner 170 minutes at the 7 µm tile
+# where the release build takes a minute.  No LTO and the default codegen units, so
+# the fifteen test binaries still build in parallel and incrementally; the debug
+# assertions stay on.
+[profile.test]
+opt-level = 3
 
 [profile.release]
 opt-level = 3        # maximum optimization
 lto = true           # link-time optimization across crates
 codegen-units = 1    # single codegen unit for better LTO
 strip = true         # strip debug symbols from binary
+
+# The release build with its symbols and line tables, for a profiler:
+# `cargo build --profile profiling`, then `samply record target/profiling/gdscheck ...`.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
 
 [[bin]]
 name = "gdscheck"
@@ -44,11 +64,13 @@ path = "gen/main.rs"
 required-features = ["dev-tools"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 gds21 = "3.0.0-pre.2"
 serde = { version = "1", features = ["derive"] }
-serde_yml = "0.0.12"
+serde_norway = "0.9"
 flate2 = "1"
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 rayon = "1"
-i_overlay = "4.5.1"
+libc = "0.2"
+smallvec = { version = "1.13", features = ["union", "const_generics"] }
+i_overlay = "9.0.0"

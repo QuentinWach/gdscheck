@@ -1,0 +1,295 @@
+// SPDX-FileCopyrightText: 2026 aesc silicon
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Structural checks that every embedded PDK must satisfy, run over all of them.
+//!
+//! These catch the config mistakes that produce a *false clean* rather than an error —
+//! the dangerous kind, because the run still reports success:
+//!
+//! * A connect-graph entry naming a layer that does not exist is silently dropped
+//!   (`pdk.rs`, `from_yaml`), so net extraction quietly stops bridging through it and
+//!   every net-aware rule downstream passes on nets that are wrong.
+//! * An eager virtual layer whose source is itself virtual resolves to nothing:
+//!   `compute_virtual_layers` reads only what the flattened layout already holds, and
+//!   nothing warns.
+//!
+//! Each is cheap to assert and impossible to spot by reading a 600-line `pdk.yml`, so
+//! they belong here rather than in any one PDK's test file.
+
+use gdscheck::parse_virtual_op;
+use gdscheck::pdk::PdkConfig;
+
+/// A PDK's own `pdk.yml` as raw YAML.  The parsed `PdkConfig` has already discarded the
+/// layer *names* in the connect graph (they are resolved to GDS keys, and unresolvable
+/// ones are dropped), so checking those needs the source text.
+fn raw_pdk_yml(process: &str) -> serde_norway::Value {
+    let path = format!("{}/pdks/{}/pdk.yml", env!("CARGO_MANIFEST_DIR"), process);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// Every embedded PDK is covered automatically, so adding one cannot skip these checks.
+fn processes() -> Vec<&'static str> {
+    let v = PdkConfig::embedded_processes();
+    assert!(!v.is_empty(), "no embedded PDKs found");
+    v
+}
+
+/// Every deck and suite the PDK advertises must actually load. `list-decks` reads the
+/// index alone, so an unreadable or malformed deck file otherwise only surfaces when
+/// someone runs that deck.
+#[test]
+fn every_declared_deck_and_suite_loads() {
+    for process in processes() {
+        let pdk = PdkConfig::for_process(process).unwrap_or_else(|e| panic!("{process}: {e}"));
+        for deck in &pdk.decks {
+            pdk.load_deck(&deck.name)
+                .unwrap_or_else(|e| panic!("{process}: deck '{}': {e}", deck.name));
+        }
+        for suite in &pdk.suites {
+            pdk.load_suite(&suite.name)
+                .unwrap_or_else(|e| panic!("{process}: suite '{}': {e}", suite.name));
+        }
+    }
+}
+
+/// Every derived layer's `op` must parse, with whatever `radius`/`min`/`max` the
+/// sentence gave it.  The sentence parser has already typed each op against its
+/// operands at load; this asks the merge cache's own parser, which is what runs.
+#[test]
+fn every_virtual_layer_op_parses() {
+    for process in processes() {
+        let pdk = PdkConfig::for_process(process).unwrap();
+        for vl in &pdk.virtual_layers {
+            if vl.op == "inside_ring" {
+                continue; // eager only: dispatched by name in `compute_virtual_layers`
+            }
+            parse_virtual_op(&vl.op, vl.radius, vl.min, vl.max, vl.slack, 0.001)
+                .unwrap_or_else(|e| panic!("{process}: virtual layer '{}': {e}", vl.name));
+        }
+        for el in &pdk.edge_layers {
+            gdscheck::parse_edge_op(&el.op, el.min, el.max, el.fraction, 0.001)
+                .unwrap_or_else(|e| panic!("{process}: edge layer '{}': {e}", el.name));
+        }
+    }
+}
+
+/// Every source a derived layer names must resolve, and none may name itself.  The
+/// sentence parser refuses an unknown name at load, so this guards the lowering: an
+/// inner layer it invented has to be registered like any other.
+#[test]
+fn every_virtual_layer_source_resolves() {
+    for process in processes() {
+        let pdk = PdkConfig::for_process(process).unwrap();
+        let all: Vec<(&str, &[String])> = pdk
+            .virtual_layers
+            .iter()
+            .map(|v| (v.name.as_str(), v.layers.as_slice()))
+            .chain(
+                pdk.edge_layers
+                    .iter()
+                    .map(|e| (e.name.as_str(), e.layers.as_slice())),
+            )
+            .collect();
+        for (name, layers) in all {
+            assert!(
+                pdk.layer(name).is_some(),
+                "{process}: derived layer '{name}' has no assigned layer number"
+            );
+            for src in layers {
+                assert!(
+                    pdk.layer(src).is_some(),
+                    "{process}: derived layer '{name}' names unknown source '{src}'"
+                );
+                assert_ne!(
+                    src, name,
+                    "{process}: derived layer '{name}' references itself"
+                );
+            }
+        }
+    }
+}
+
+/// Every layer a deck's whole-layout checks read has to be one the layout can hold:
+/// built by an eager op from drawn layers.  `eager_layers` refuses the others with the
+/// rule's name; asked here for every deck so the refusal surfaces before a run does.
+#[test]
+fn every_deck_can_materialise_what_its_whole_layout_checks_read() {
+    for process in processes() {
+        let pdk = PdkConfig::for_process(process).unwrap();
+        for deck in &pdk.decks {
+            let rules = pdk.load_deck(&deck.name).unwrap();
+            pdk.eager_layers(&rules)
+                .unwrap_or_else(|e| panic!("{process}: deck '{}': {e}", deck.name));
+        }
+    }
+}
+
+/// Every name in the connect graph must resolve. `from_yaml` drops a spec naming an
+/// unknown layer without complaint, so a single typo silently removes a level from the
+/// via stack — and the antenna rules that cut the stack at a fixed level then read a
+/// different net than the deck author meant.
+#[test]
+fn every_connect_graph_layer_resolves() {
+    for process in processes() {
+        let pdk = PdkConfig::for_process(process).unwrap();
+        let raw = raw_pdk_yml(process);
+        let Some(specs) = raw.get("connectivity").and_then(|c| c.as_sequence()) else {
+            continue; // a PDK may declare no connect graph
+        };
+
+        for (i, spec) in specs.iter().enumerate() {
+            let connector = spec
+                .get("connector")
+                .and_then(|c| c.as_str())
+                .unwrap_or_else(|| panic!("{process}: connectivity[{i}] has no connector"));
+            assert!(
+                pdk.layer(connector).is_some(),
+                "{process}: connectivity[{i}] names unknown connector '{connector}'"
+            );
+            let layers = spec
+                .get("layers")
+                .and_then(|l| l.as_sequence())
+                .unwrap_or_else(|| panic!("{process}: connectivity[{i}] has no layers"));
+            for l in layers {
+                let name = l.as_str().unwrap();
+                assert!(
+                    pdk.layer(name).is_some(),
+                    "{process}: connectivity[{i}] ('{connector}') names unknown layer '{name}'"
+                );
+            }
+        }
+
+        // Nothing was dropped on the way in: the resolved graph is as long as declared.
+        assert_eq!(
+            pdk.connectivity.len(),
+            specs.len(),
+            "{process}: {} of {} connect steps were dropped as unresolvable",
+            specs.len() - pdk.connectivity.len(),
+            specs.len()
+        );
+    }
+}
+
+/// The gf180mcuD antenna rules select a net by *prefix* of the connect list, so each
+/// rule carries the index it needs as a `level`. That makes the list's order part of the
+/// deck's meaning: inserting or reordering a step silently moves every antenna rule to
+/// the wrong point in the process stack, and no geometry test would notice. Pin it.
+#[test]
+fn gf180_connect_order_is_pinned_for_the_antenna_levels() {
+    // (connector, first bridged layer) per step, with the antenna rule each index feeds.
+    const WANT: &[(&str, &str)] = &[
+        ("contact", "poly2_drawn"),    // 0
+        ("contact", "ncomp_con"),      // 1
+        ("contact", "pcomp_con"),      // 2
+        ("contact", "natcomp_con"),    // 3
+        ("ntap", "nwell"),             // 4
+        ("ntap_dn", "dnwell_n"),       // 5
+        ("ptap", "lvpwell"),           // 6
+        ("mvsd_tap", "mvsd"),          // 7
+        ("ntap", "nwell"),             // 8
+        ("mvpsd_tap", "mvpsd"),        // 9
+        ("contact", "metal1_drawn"),   // 10 -> ANT.8
+        ("via1", "metal1_drawn"),      // 11 -> ANT.16_*_ANT.2
+        ("via1", "metal2_drawn"),      // 12 -> ANT.16_*_ANT.9
+        ("via2", "metal2_drawn"),      // 13 -> ANT.16_*_ANT.3
+        ("via2", "metal3_drawn"),      // 14 -> ANT.16_*_ANT.10
+        ("via3", "metal3_drawn"),      // 15 -> ANT.16_*_ANT.4
+        ("via3", "fusetop"),           // 16
+        ("via3", "metal4_drawn"),      // 17 -> ANT.16_*_ANT.11
+        ("via4", "metal4_drawn"),      // 18 -> ANT.16_*_ANT.5
+        ("via4", "fusetop"),           // 19 -> ANT.16_iii_ANT.15_V4_MIMB
+        ("via4", "metal5_drawn"),      // 20 -> ANT.16_*_ANT.12
+        ("mimcap_top_tap", "fusetop"), // 21 -> ANT.16_*_ANT.6
+    ];
+    let pdk = PdkConfig::for_process("gf180mcuD").expect("gf180mcuD loads");
+    assert_eq!(
+        pdk.connectivity.len(),
+        WANT.len(),
+        "connect list length changed; antenna `level`s now point elsewhere"
+    );
+    for (i, (spec, (conn, first))) in pdk.connectivity.iter().zip(WANT).enumerate() {
+        let key = |n: &str| {
+            let l = pdk
+                .layer(n)
+                .unwrap_or_else(|| panic!("step {i}: unknown layer '{n}'"));
+            (l.gds_layer as i16, l.gds_datatype as i16)
+        };
+        assert_eq!(
+            spec.connector,
+            key(conn),
+            "connect step {i}: connector moved"
+        );
+        assert_eq!(
+            spec.layers.first().copied(),
+            Some(key(first)),
+            "connect step {i}: bridged layer moved"
+        );
+    }
+}
+
+/// Every mode word a deck writes must be one its check knows.  A check reads its words
+/// at run time and, on one it does not know, says so on stderr and runs with the
+/// default (`abutting: reprot` is `ignore`, `pairs: al` is `disjoint`) or not at all -
+/// either way the run reports success.  The vocabulary is the engine's, gathered here
+/// by key; a layer-valued param is written under `layer_params` and resolved to a
+/// number at load, so a word left in `params` is a mode word and nothing else.
+#[test]
+fn every_mode_word_is_one_its_check_knows() {
+    use gdscheck::pdk::Param;
+    let vocabulary: &[(&str, &[&str])] = &[
+        ("abutting", &["ignore", "report", "related"]),
+        ("angle", &["bent"]),
+        ("diode", &["with", "without"]),
+        ("metric", &["euclidian", "square", "sidewall"]),
+        ("net", &["same", "different", "connected"]),
+        (
+            "op",
+            &["apart", "beyond", "overlap", "touching", "uncovered"],
+        ),
+        ("pairs", &["disjoint", "overlapping", "any"]),
+        ("reach", &["round"]),
+        (
+            "scope",
+            &[
+                "chip",
+                "contained",
+                "edge",
+                "hole",
+                "part",
+                "polygon",
+                "region",
+                "window",
+            ],
+        ),
+        ("sides", &["all", "adjacent", "line_end"]),
+        ("span", &["narrowest"]),
+        ("touching", &["separate"]),
+        ("walls", &["unshared"]),
+    ];
+    for process in processes() {
+        let pdk = PdkConfig::for_process(process).unwrap();
+        for deck in &pdk.decks {
+            for rule in pdk.load_deck(&deck.name).unwrap() {
+                for (key, param) in &rule.params {
+                    let Param::Word(word) = param else {
+                        continue;
+                    };
+                    let known = vocabulary
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, words)| words.contains(&word.as_str()));
+                    assert_eq!(
+                        known,
+                        Some(true),
+                        "{process}: deck '{}', rule {}: `{key}: {word}` is not a word the \
+                         engine reads — a check would run as if it were absent",
+                        deck.name,
+                        rule.id
+                    );
+                }
+            }
+        }
+    }
+}

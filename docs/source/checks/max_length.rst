@@ -12,6 +12,9 @@ must be at most ``value``. The dual of :doc:`max_dim`.
 Semantics
 ---------
 
+The extent is a difference of two grid coordinates and is compared exactly against
+``value`` on the grid.
+
 For each merged region on the rule's layer, take its axis-aligned bounding box
 ``(x0, y0)-(x1, y1)`` and compute ``length = max(x1 - x0, y1 - y0)``. A region whose
 length exceeds ``value`` is a violation.
@@ -43,9 +46,9 @@ core contains that centroid).
 KLayout equivalent
 ------------------
 
-Not a single built-in KLayout ``Region`` operator — a bounding-box measurement, analogous
-to filtering on ``Region#extents.width``/``.height`` (whichever is larger) in a KLayout
-DRC script.
+``Region#with_bbox_max(value + one grid step, nil)``: the polygons whose bounding box's
+larger side is over ``value``, which is how IHP's deck reads its metal-filler maxima
+(``MnFil.a2``, ``TMnFil.a1``) and ``LBE.b``.
 
 
 Example

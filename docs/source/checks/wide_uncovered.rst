@@ -5,8 +5,8 @@
 wide_uncovered
 ==============
 
-A connected region of a base layer that is *wide* (contains a spot at least ``value`` µm
-across, in every direction) must enclose at least one shape of a feature layer; a wide
+A connected region of a base layer that is *wide* (contains a spot more than ``value``
+µm across, in every direction) must enclose at least one shape of a feature layer; a wide
 region with none is a violation. Used for IHP's ``Slt.c``: a metal plate wider than
 30 µm must contain slots (to avoid CMP dishing / plating stress), unless it's exempted
 (pads, MIM, inductors).
@@ -16,7 +16,7 @@ Semantics
 ---------
 
 Runs on ``MergedCache::plate_regions``, the same tiled, halo-bounded region analysis
-:doc:`min_region_density` uses: "wide" is determined by a tiled erosion of radius
+:doc:`min_density` uses at ``scope: region``: "wide" is determined by a tiled erosion of radius
 ``value / 2`` (a region that survives erosion by half the width threshold has a spot at
 least ``value`` across somewhere), and each region's enclosed feature area is accumulated
 from the same per-tile pass — so a dense base layer (a chip-wide metal plate) is never

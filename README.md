@@ -6,6 +6,8 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 # gdscheck
 
+![gdscheck](https://raw.githubusercontent.com/aesc-silicon/gdscheck/v0.2.0/images/gdscheck-logo.svg)
+
 A fast, open-source **DRC (Design Rule Check) engine for GDSII layouts**,
 written in Rust.
 
@@ -17,7 +19,7 @@ be visualised in any tool that reads `.lyrdb`.
 
 > **Warning**
 >
-> `gdscheck` is **experimental and under active development** (`v0.1.0`).
+> `gdscheck` is **experimental and under active development** (`v0.2.0`).
 > Coverage is incomplete and results are not yet qualified for tape-out.
 > Always cross-check against a reference DRC engine before sign-off.
 
@@ -101,8 +103,11 @@ Pass exactly one of `--suite <name>` (a curated rule selection) or `--deck
 exclusive.
 
 The PDK files are embedded in the binary, so `--process ihp-sg13g2` works
-with no external files. `--process` also accepts a path to a `pdk.yml` for a
-custom or out-of-tree PDK.
+with no external files. `--process` also accepts a path to a `pdk.yml`, or the
+name of a PDK on the PDK path: directories given with `--pdk-path <dir>` or in
+`GDSCHECK_PDK_PATH`, each holding `<process>/pdk.yml`, searched before the
+embedded PDKs. That is where a commercial PDK or a company variant lives; it
+can `extends: ihp-sg13g2` and reuse the embedded decks by path.
 
 Example, using the bundled IHP SG13G2 PDK and sample design:
 
@@ -121,6 +126,7 @@ through the violations.
 Discover what a PDK offers without running a check:
 
 ```bash
+gdscheck list-processes
 gdscheck list-decks  --process ihp-sg13g2
 gdscheck list-suites --process ihp-sg13g2
 gdscheck show-deck   --process ihp-sg13g2 --deck metal1
@@ -131,15 +137,24 @@ gdscheck show-deck   --process ihp-sg13g2 --deck metal1
 | Option | Meaning |
 | --- | --- |
 | `-i, --input` | Input GDS file (plain or `.gz`). |
-| `-p, --process` | PDK process name (e.g. `ihp-sg13g2`, embedded) or a path to a `pdk.yml`. |
+| `-p, --process` | PDK process name (embedded, or on the PDK path) or a path to a `pdk.yml`. |
+| `--pdk-path` | A directory of PDKs (`<dir>/<process>/pdk.yml`) searched before the embedded ones; repeatable, before the subcommand. `GDSCHECK_PDK_PATH` lists more. |
 | `-d, --deck` | Per-layer deck(s) to run, comma-separated and/or repeated (e.g. `metal2` or `metal1,via1`). Mutually exclusive with `--suite`. |
 | `-s, --suite` | A curated rule selection to run (e.g. `main` or `precheck`). Mutually exclusive with `--deck`. See [Suites](#suites). |
 | `-t, --topcell` | Name of the top cell to flatten and check. |
 | `-r, --report` | Optional output `.lyrdb` report path. |
 | `--threads` | Worker threads (`0` = all logical cores, the default). |
+| `--tile` | Tile size of the merge cache in µm (default 20, or `GDSCHECK_TILE_UM`); the result must not depend on it. |
 
-`list-decks` and `list-suites` take only `-p, --process`; `show-deck` also
-takes `-d, --deck` (the deck to dump).
+`list-processes` takes no option beyond `--pdk-path`; `list-decks` and
+`list-suites` take only `-p, --process`; `show-deck` also takes `-d, --deck`
+(the deck to dump).
+
+`run` exits with `0` when the layout is clean, `2` when violations were found,
+and `1` on any error (unreadable input, unknown PDK, deck or suite, failed
+report write), so scripts can branch on the status without parsing output. A
+violation the PDK waives is reported but does not fail the run: a layout whose
+only findings are waived exits with `0`.
 
 ## PDK, deck and suite format
 
@@ -164,9 +179,7 @@ decks:
     description: Metal 2
 
 virtual_layers:
-  - name: Pad
-    op: union
-    layers: [Passiv, Passiv.sbump, Passiv.pillar, dfpad]
+  Pad: Passiv or Passiv.sbump or Passiv.pillar or dfpad
 
 layers:
   - name: Metal2
@@ -196,10 +209,11 @@ rules:
     value: 0.21
 
   - id: M2.c               # windowed density floor over 200 µm tiles
-    check: min_windowed_density
+    check: min_density
     layers: [Metal2, Metal2.filler]
     value: 20.0
     params:
+      scope: window
       window: 200.0
 ```
 
@@ -257,13 +271,10 @@ density checks). Run `gdscheck list-suites --process ihp-sg13g2` to see them.
 | `min_area` | Polygon area ≥ `value` µm². |
 | `max_area` | Polygon area ≤ `value` µm². |
 | `min_enclosure` | `layers[0]` enclosed by `layers[1]` with clearance ≥ `value` µm. |
-| `min_density` | Layer density over the chip/boundary area ≥ `value` %. |
-| `max_density` | Layer density over the chip/boundary area ≤ `value` %. |
-| `min_windowed_density` | Density ≥ `value` % in every `window`×`window` µm tile. |
-| `max_windowed_density` | Density ≤ `value` % in every `window`×`window` µm tile. |
+| `min_density` | Layer density ≥ `value` % over the chip, in every `window`×`window` µm tile, or per large region (`scope`). |
+| `max_density` | Layer density ≤ `value` % over the chip, per window, or per region (`scope`). |
 | `offgrid` | All vertices must lie on the `value` µm manufacturing grid. |
-| `forbidden` | The layer(s) must be empty; any shape is a violation. |
-| `inside_boundary` | Every shape must lie inside the boundary shape (e.g. EdgeSeal). |
+| `forbidden` | The layer(s) must be empty; with `op` the uncovered part, overlap, apart or touching regions, or anything beyond a boundary. |
 | `ring_covers_boundary` | A ring layer must provide gap-free coverage of the boundary edges. |
 | `no_ring` | The layer must not form a closed ring. |
 
@@ -272,7 +283,7 @@ density checks). Run `gdscheck list-suites --process ihp-sg13g2` to see them.
 - `min_density` / `max_density` accept `boundary_layer` (and optional
   `boundary_datatype`); the denominator area is the bounding box of that
   layer (typically `EdgeSeal`, GDS layer 39) instead of the whole layout.
-- `*_windowed_density` require a `window` parameter (tile size in µm).
+- `scope: window` requires a `window` parameter (tile size in µm).
 
 ## Output
 

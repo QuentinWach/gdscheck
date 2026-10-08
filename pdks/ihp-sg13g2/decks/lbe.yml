@@ -8,17 +8,21 @@ rules:
     layers: [LBE]
     value: 100.00
   - id: LBE.b
-    check: max_width
+    check: max_length
     layers: [LBE]
     value: 1500.00
   - id: LBE.b1
     check: max_area
     layers: [LBE]
     value: 250000.00
+    params:
+      touching: separate
   - id: LBE.b2
     check: min_area
     layers: [LBE]
     value: 30000.00
+    params:
+      touching: separate
   - id: LBE.c
     check: min_space
     layers: [LBE]
@@ -39,6 +43,18 @@ rules:
     check: min_space
     layers: [LBE, Passiv]
     value: 50.0
+  - id: LBE.e
+    check: forbidden
+    layers: [LBE, dfpad]
+    value: 0.0
+    params:
+      op: overlap
+  - id: LBE.e
+    check: forbidden
+    layers: [LBE, Passiv]
+    value: 0.0
+    params:
+      op: overlap
   - id: LBE.f
     check: min_space
     layers: [LBE, Activ]
@@ -51,6 +67,5 @@ rules:
     check: max_density
     layers: [LBE]
     value: 20.00
-    params:
-      boundary_layer: 39
-      boundary_datatype: 4
+    layer_params:
+      boundary: EdgeSeal.boundary

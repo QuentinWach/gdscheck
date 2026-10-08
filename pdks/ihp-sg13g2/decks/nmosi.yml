@@ -7,19 +7,27 @@ rules:
     check: min_enclosure
     layers: [nBuLay, IsoPWellAct]
     value: 1.24
+    params:
+      metric: euclidian
   - id: nmosi.c
     check: min_space
-    layers: [NWellRing, IsoPWellAct]
+    layers: [NWellNmosi, IsoPWellAct]
     value: 0.39
+    params:
+      abutting: report
   - id: nmosi.d
     check: min_width
-    layers: [NWellNBuLay]
+    layers: [NWellNBuLayIsoRing]
     value: 0.62
   - id: nmosi.f
     check: min_width
     layers: [nSDBlockIso]
     value: 0.62
   - id: nmosi.g
-    check: nonempty
-    layers: [NmosiGBad]
-    value: 0.0
+    check: min_enclosure
+    layers: [SalBlockIso, nSDBlockIso]
+    value: 0.15
+    params:
+      metric: euclidian
+    layer_params:
+      over: Activ

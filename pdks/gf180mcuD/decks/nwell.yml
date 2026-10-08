@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# N-well.  All 13 rules in this section.
+rules:
+  - id: NW.1a_LV
+    check: min_width
+    layers: [nw_lv]
+    value: 0.86
+  - id: NW.1a_MV
+    check: min_width
+    layers: [nw_mv]
+    value: 0.86
+  - id: NW.1b_LV
+    check: min_width
+    layers: [nw_res_lv]
+    value: 2.0
+  - id: NW.1b_MV
+    check: min_width
+    layers: [nw_res_mv]
+    value: 2.0
+  - id: NW.2a_LV
+    check: min_space
+    layers: [nw_lv_no_ymtp]
+    value: 0.6
+  - id: NW.2a_LV
+    check: min_notch
+    layers: [nw_lv_no_ymtp]
+    value: 0.6
+  - id: NW.2a_MV
+    check: min_space
+    layers: [nw_mv_no_ymtp]
+    value: 0.74
+  - id: NW.2a_MV
+    check: min_notch
+    layers: [nw_mv_no_ymtp]
+    value: 0.74
+  # "Outside DNWELL": wells inside a deep well are shorted through it (section 7.4),
+  # so a gap between two of them is never one of different potential, whether or not
+  # each carries a tap of its own.
+  - id: NW.2b_LV
+    check: min_space
+    layers: [nw_lv_out_dnwell]
+    value: 1.4
+    params:
+      net: different
+  - id: NW.2b_MV
+    check: min_space
+    layers: [nw_mv_out_dnwell]
+    value: 1.7
+    params:
+      net: different
+  # A gap between a 5 V well and a 3.3 V one is the 5 V well's: the stricter value
+  # applies, and neither voltage layer holds the pair.
+  - id: NW.2a_MV
+    check: min_space
+    layers: [nw_mv, nw_lv]
+    value: 0.74
+  - id: NW.2b_MV
+    check: min_space
+    layers: [nw_mv_out_dnwell, nw_lv_out_dnwell]
+    value: 1.7
+    params:
+      net: different
+  - id: NW.3
+    check: min_space
+    layers: [nwell, dnwell]
+    value: 3.1
+    params:
+      abutting: report
+  - id: NW.4
+    check: forbidden
+    layers: [nwell_on_lvpwell]
+    value: 0.0
+  - id: NW.5_LV
+    check: min_enclosure
+    layers: [dnwell, nw_lv]
+    value: 0.5
+    params:
+      interacting_only: 1
+      metric: euclidian
+  - id: NW.5_LV
+    check: forbidden
+    layers: [nw5_lv_crossing]
+    value: 0.0
+  - id: NW.5_MV
+    check: min_enclosure
+    layers: [dnwell, nw_mv]
+    value: 0.5
+    params:
+      interacting_only: 1
+      metric: euclidian
+  - id: NW.5_MV
+    check: forbidden
+    layers: [nw5_mv_crossing]
+    value: 0.0
+  - id: NW.6
+    check: forbidden
+    layers: [nwell_res_in_dnwell]
+    value: 0.0

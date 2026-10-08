@@ -39,7 +39,23 @@ Two layers, positional — same roles as :doc:`min_enclosure`:
 Parameters
 ----------
 
-None beyond ``layers`` and ``value`` (µm, the maximum allowed margin).
+``sides``
+   Optional. ``all`` (the default): no side may exceed ``value`` — the shape's largest
+   margin is the one read. ``any``: at least one side is within ``value`` — the shape's
+   smallest margin is the one read, and a shape enclosed by more than ``value`` on every
+   side is the violation. Paired with a :doc:`min_enclosure` at the same value, ``all``
+   pins every side to exactly that value and ``any`` pins one side to it (GF180
+   ``HRES.10``: the implant overlaps the salicide block by exactly 0.1 µm where it
+   crosses it, however far it runs past it elsewhere). ``adjacent`` and ``line_end`` are
+   about a margin falling short and have no maximum.
+
+``metric``
+   Optional. ``projection`` (the default) or ``euclidian``, as in :doc:`min_enclosure`.
+
+``interacting_only``
+   Optional. As in :doc:`min_enclosure`: a shape that partially overlaps an enclosing
+   region is measured on the facing pairs of its contained side — the maximum of an
+   extension, a cover that may reach past the target it crosses by at most ``value``.
 
 
 Violation markers

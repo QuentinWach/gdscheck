@@ -16,11 +16,29 @@ developer tasks:
 
    just build          # cargo build --release
    just test           # cargo test --release
+   just test-tile      # the same at a 7 µm tile, as CI also runs it
    just clippy         # cargo clippy --release -- -D warnings
    just gen-testdata   # regenerate the IHP SG13G2 test fixtures
    just check          # clippy + test + cargo fmt --check — the pre-commit gate
 
-Run ``just check`` before opening a change — it's the same gate CI runs.
+Run ``just check`` before opening a change — it's the same gate CI runs. CI runs the
+suite a second time with ``GDSCHECK_TILE_UM=7``: no result may depend on the tile size,
+and a fixture whose shapes a 7 µm line happens to cross is where one did.
+
+CI additionally runs the ``main`` suite over the real layouts in
+`aesc-silicon/reference-designs <https://github.com/aesc-silicon/reference-designs>`_
+(``ci/run-designs.sh``, one job per PDK) to catch crashes, hangs and false violations
+that the synthetic fixtures cannot. Run it locally with ``just designs <process>``
+against a sibling checkout of that repository.
+
+Every design's run in that workflow prints its performance figures after the result
+(wall and CPU time, cores, peak memory, the slowest rules; ``ci/perf-summary.py``), and
+the same land in the job summary as a table. For a number rather than a trend, compare
+two commits on this machine: ``ci/bench.sh <a> <b> [process...]`` builds both, runs every
+design under each in turns (``RUNS`` times, ``THREADS`` threads, ``DESIGN=process:top:path``
+for one more), and prints the best run per rule side by side, per check family and for
+the rules that moved. Runner times are noisy; CPU seconds, cores and peak memory are
+what to read there.
 
 
 Adding a rule to a deck
@@ -51,11 +69,12 @@ Signature depends on what the check needs:
 
 **Prefer the tiled merge cache over a global merge** unless every layer the check reads is
 genuinely sparse (isolated vias, contacts, device markers — see
-:doc:`checks/must_interact` for a deliberate, documented example of when a global merge is
-safe). A check that globally unions a dense, chip-wide layer works on a small test
+:doc:`checks/ring_covers_boundary` for a deliberate, documented example of when a global
+merge is safe). A check that globally unions a dense, chip-wide layer works on a small test
 pattern and then runs out of memory the first time someone points it at a real SoC —
-exactly the failure class :doc:`checks/forbidden_unless_labeled` was rewritten to avoid
-(see :doc:`architecture`, *Region stitching* and *Lazy virtual layers*, for the primitives
+exactly the failure class the antenna rule Ant.h's derivation was once rewritten to avoid,
+before it became a chain of sentence layers in ``pdk.yml`` (see :doc:`architecture`,
+*Region stitching* and *Lazy virtual layers*, for the primitives
 available: ``MergedCache::regions``/``stitch_labeled`` for whole-region area/marker/
 predicate aggregation, ``register_virtual`` for a derivation chain expressed as tiled
 virtual layers).
@@ -127,9 +146,10 @@ Coding conventions
   ``Violation``: name the layer(s), state ``<measured> <cmp> <limit>`` with units, end
   with the location — consistency here is what makes report diffing and KLayout
   cross-checks tractable.
-* Prefer extending an existing shared primitive (``helper.rs``'s facing-wall scan,
-  region-spacing engine, or boolean-residual/extension engines; ``merge.rs``'s tiled
-  virtual-layer and region-stitching machinery) over writing a new one-off algorithm —
+* Prefer extending an existing shared primitive (``geom.rs``'s facing-wall scan and
+  ``checks/width/``'s drivers, ``helper.rs``'s region-spacing engine and
+  boolean-residual/extension engines; ``merge.rs``'s tiled virtual-layer and
+  region-stitching machinery) over writing a new one-off algorithm —
   most new checks are a variation on an existing measurement, not a new kind of geometry
   problem.
 * Comments explain *why*, not *what* — a hidden constraint, a subtle invariant, a

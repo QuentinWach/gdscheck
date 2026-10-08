@@ -19,24 +19,39 @@ fn extract(process: &str, fixture: &str) -> (Connectivity, f64) {
     let lib = load_gds(fixture).expect("load fixture");
     let dbu_to_um = lib.units.1 * 1e6;
 
-    let mut layout = flatten::flatten_to_elems("TOP", &lib, None);
-    pdk.compute_virtual_layers(&mut layout, dbu_to_um);
+    let mut layout = flatten::flatten_to_elems("TOP", &lib, None, &[]);
+    // No rules here, so only the layers whose op has no tiled form are materialised.
+    let eager = pdk.eager_layers(&[]).expect("eager layers");
+    pdk.compute_virtual_layers(&mut layout, dbu_to_um, &eager);
 
     let tile_dbu = (merge::TILE_UM / dbu_to_um).round() as i32;
     let halo_dbu = (merge::MIN_HALO_UM / dbu_to_um).ceil() as i32;
     let mut cache = merge::MergedCache::new(tile_dbu, halo_dbu, HashMap::new());
-    for spec in pdk.tiled_virtual_layers() {
-        let op = parse_virtual_op(&spec.op, spec.radius, dbu_to_um).expect("virtual op");
+    for spec in pdk.tiled_virtual_layers(&eager) {
+        let op = parse_virtual_op(
+            &spec.op,
+            spec.radius,
+            spec.min,
+            spec.max,
+            spec.slack,
+            dbu_to_um,
+        )
+        .expect("virtual op");
         cache.register_virtual(spec.key, op, spec.sources, spec.text);
     }
 
-    (Connectivity::build(&mut cache, &layout, &pdk.connectivity), dbu_to_um)
+    (
+        Connectivity::build(&mut cache, &layout, &pdk.connectivity, dbu_to_um, &[]),
+        dbu_to_um,
+    )
 }
 
 #[test]
 fn gates_bridged_by_metal2_share_a_net() {
-    let (con, dbu_to_um) =
-        extract("ihp-sg13g2", "tests/data/ihp-sg13g2/connectivity/two_gates.gds.gz");
+    let (con, dbu_to_um) = extract(
+        "ihp-sg13g2",
+        "tests/data/ihp-sg13g2/connectivity/two_gates.gds.gz",
+    );
 
     // A point inside each gate's GatPoly (layer 5/0).  OFFSET = 20 µm; gates at x-origin
     // 20, 28, 44; each poly spans origin+0.5 .. origin+1.5 in x, ~19..25 in y.
@@ -60,8 +75,7 @@ fn gates_bridged_by_metal2_share_a_net() {
 #[case("ihp-sg13g2")]
 #[case("ihp-sg13cmos5l")]
 fn nwell_tie_shorts_strapped_wells(#[case] process: &str) {
-    let (con, dbu_to_um) =
-        extract(process, "tests/data/ihp-sg13g2/nwell/NW.b1.same_net.gds.gz");
+    let (con, dbu_to_um) = extract(process, "tests/data/ihp-sg13g2/nwell/NW.b1.same_net.gds.gz");
 
     // OFFSET = 20 µm.  Bare pair of 1×1 µm wells at x 20..21, tied pair at x 24..25;
     // in each pair the wells sit at y 20..21 and y 22..23 (a 1.00 µm gap).  The tied
@@ -76,8 +90,14 @@ fn nwell_tie_shorts_strapped_wells(#[case] process: &str) {
     let tied_hi = at(nwell, 24.5, 22.5).expect("tied upper well on a net");
     let strap = at(metal1, 24.5, 21.5).expect("strap on a net");
 
-    assert_eq!(tied_lo, tied_hi, "wells strapped through their taps → one net");
-    assert_eq!(tied_lo, strap, "the well net is the strap's net, i.e. tied via the tap");
+    assert_eq!(
+        tied_lo, tied_hi,
+        "wells strapped through their taps → one net"
+    );
+    assert_eq!(
+        tied_lo, strap,
+        "the well net is the strap's net, i.e. tied via the tap"
+    );
     assert_ne!(bare_lo, bare_hi, "untied wells → separate nets");
     assert_ne!(bare_lo, tied_lo);
     assert_ne!(bare_hi, tied_lo);

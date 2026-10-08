@@ -9,11 +9,11 @@ rules:
     value: 0.19
   - id: V1.b
     check: min_space
-    layers: [Via1]
+    layers: [Via1NoSealring]
     value: 0.22
   - id: V1.b1
-    check: min_array_space
-    layers: [Via1]
+    check: min_space
+    layers: [Via1NoSealring]
     value: 0.29
     params:
       rows: 3
@@ -22,7 +22,13 @@ rules:
     check: min_enclosure
     layers: [Metal1, Via1NoSealring]
     value: 0.01
+    params:
+      metric: euclidian
   - id: V1.c1
-    check: min_endcap_enclosure
+    check: min_enclosure
     layers: [Metal1, Via1NoSealring]
     value: 0.05
+    params:
+      metric: euclidian
+      sides: adjacent
+      trigger: 0.05

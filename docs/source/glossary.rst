@@ -34,12 +34,13 @@ Glossary
       :doc:`virtual-ops`.
 
    Eager (virtual layer)
-      The default virtual-layer evaluation mode: computed once, up front, as ordinary
-      boundaries. See :doc:`virtual-ops`.
+      A virtual layer computed once, up front, as ordinary boundaries in the layout —
+      because a whole-layout check reads it, or its op only exists that way. See
+      :doc:`virtual-ops`.
 
    Lazy (virtual layer)
-      The ``mode: lazy`` virtual-layer evaluation mode: registered with the tiled merge
-      cache and built per tile on first use. See :doc:`virtual-ops` and
+      A virtual layer registered with the tiled merge cache and built per tile on first
+      use; every virtual layer, unless a rule needs it eager. See :doc:`virtual-ops` and
       :doc:`architecture`.
 
    FlatLayout
@@ -68,9 +69,9 @@ Glossary
 
    Net-aware check
       A check that needs electrical connectivity (which shapes are the same net), e.g.
-      the antenna-ratio family and ``min_space_different_net``. Requires the PDK's
+      the antenna-ratio family and a ``min_space`` gated on ``net``. Requires the PDK's
       ``connectivity:`` graph and runs unless ``--no-connectivity`` is passed. See
-      :doc:`checks/antenna_ratio`, :doc:`checks/min_space_different_net`.
+      :doc:`checks/antenna_ratio`, :doc:`checks/min_space`.
 
    Connectivity graph
       A PDK's declared list of connector (via/contact) layers and the conductor layers

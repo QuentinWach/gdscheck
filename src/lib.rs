@@ -2,11 +2,13 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-pub mod cache;
 pub mod checks;
 pub mod connectivity;
+pub mod expr;
 pub mod flatten;
+pub mod geom;
 pub mod layout;
+pub mod memory;
 pub mod merge;
 pub mod pdk;
 pub mod report;
@@ -17,6 +19,63 @@ use gds21::GdsLibrary;
 use std::io::Read;
 
 pub use violation::Violation;
+
+/// GDSII record types whose payload gds21 decodes as a string.  Each is the high byte of
+/// the record header; the low byte is the data type, `0x06` for a string.
+const STRING_RECORD_TYPES: [u8; 10] = [
+    0x02, // LIBNAME
+    0x06, // STRNAME
+    0x12, // SNAME
+    0x19, // STRING
+    0x1f, // REFLIBS
+    0x20, // FONTS
+    0x23, // ATTRTABLE
+    0x2c, // PROPVALUE
+    0x37, // MASK
+    0x3a, // SRFNAME
+];
+
+/// Give every zero-length string record a one-character payload, and report how many.
+///
+/// gds21 3.0.0-pre.2 panics on an empty string: `read_str` strips an optional trailing
+/// NUL with `data[data.len() - 1]`, which underflows to `usize::MAX` when the payload is
+/// empty. An empty label is unusual but perfectly legal, and real designs contain them —
+/// so a whole DRC run dies on a text element that carries no DRC meaning at all.
+///
+/// The repair is the smallest one that survives that code path: a two-byte NUL payload,
+/// which gds21 reads back as a single NUL character. It cannot be read back as the empty
+/// string, because the only payload length that would produce one is the length that
+/// panics. Labels are matched against patterns, and no pattern matches a NUL, so this
+/// cannot turn a rule on or off — but it is a change to the input, so it is announced
+/// rather than done quietly.
+///
+/// Anything that does not parse as a clean record stream is passed through untouched, so
+/// a malformed file still gets gds21's own error rather than one from here.
+fn repair_empty_strings(bytes: Vec<u8>) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut repaired = 0usize;
+    while i + 4 <= bytes.len() {
+        let len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+        let (rtype, dtype) = (bytes[i + 2], bytes[i + 3]);
+        if len < 4 || i + len > bytes.len() {
+            // Not a record stream we understand: hand the original to gds21 unchanged.
+            return (bytes, 0);
+        }
+        if len == 4 && dtype == 0x06 && STRING_RECORD_TYPES.contains(&rtype) {
+            out.extend_from_slice(&6u16.to_be_bytes());
+            out.extend_from_slice(&[rtype, dtype, 0x00, 0x00]);
+            repaired += 1;
+        } else {
+            out.extend_from_slice(&bytes[i..i + len]);
+        }
+        i += len;
+    }
+    if i != bytes.len() {
+        return (bytes, 0); // trailing bytes that are not a record: leave it alone
+    }
+    (out, repaired)
+}
 
 pub fn load_gds(path: &str) -> Result<GdsLibrary, Box<dyn std::error::Error>> {
     let raw = std::fs::read(path)?;
@@ -30,22 +89,98 @@ pub fn load_gds(path: &str) -> Result<GdsLibrary, Box<dyn std::error::Error>> {
         raw
     };
 
+    let (bytes, repaired) = repair_empty_strings(bytes);
+    if repaired > 0 {
+        eprintln!(
+            "warning: {path}: {repaired} empty text label(s) rewritten to a single NUL \
+             character - gds21 cannot read a zero-length string and would panic. No \
+             geometry is affected."
+        );
+    }
+
     Ok(GdsLibrary::from_bytes(&bytes)?)
+}
+
+/// Process CPU time so far, user plus system, in seconds; 0 where `/proc` is not there.
+pub fn cpu_seconds() -> f64 {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            // Fields 14 and 15 (1-based) after the parenthesised command name.
+            let rest = s.rsplit(')').next()?;
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            let ticks: f64 = f.get(11)?.parse::<f64>().ok()? + f.get(12)?.parse::<f64>().ok()?;
+            Some(ticks / 100.0)
+        })
+        .unwrap_or(0.0)
+}
+
+/// `GDSCHECK_RULE_TRACE=1`: one line per stage of a run with its wall time and the CPU
+/// time it used, so the stages that run on one core show themselves.
+struct PhaseTrace {
+    on: bool,
+    wall: std::time::Instant,
+    cpu: f64,
+}
+
+impl PhaseTrace {
+    fn new() -> Self {
+        Self {
+            on: std::env::var("GDSCHECK_RULE_TRACE").is_ok(),
+            wall: std::time::Instant::now(),
+            cpu: cpu_seconds(),
+        }
+    }
+
+    /// Close the stage `name` and open the next.
+    fn end(&mut self, name: &str) {
+        if !self.on {
+            return;
+        }
+        let (w, c) = (self.wall.elapsed().as_secs_f64(), cpu_seconds() - self.cpu);
+        eprintln!(
+            "phase {name} wall={w:.1}s cpu={c:.1}s cores={:.1} rss={:.1}GB",
+            if w > 0.0 { c / w } else { 0.0 },
+            rss_gb()
+        );
+        self.wall = std::time::Instant::now();
+        self.cpu = cpu_seconds();
+    }
+}
+
+/// The process's resident set, in GB, for the traces.
+fn rss_gb() -> f64 {
+    memory::gb(memory::rss_bytes())
 }
 
 /// Checks that need electrical connectivity (net extraction).  When connectivity is
 /// disabled (`connectivity == false`) these are skipped rather than run on no nets.
 /// Populated as net-aware checks land (e.g. the antenna ratio rules).
-pub const NET_AWARE_CHECKS: &[&str] =
-    &["antenna_ratio", "gate_connected_min_area", "min_space_different_net"];
+pub const NET_AWARE_CHECKS: &[&str] = &["antenna_ratio", "max_nets_under"];
+
+/// The DBU a layout is read in when it is drawn in a coarser one: a nanometre.
+const NM_DBU_UM: f64 = 0.001;
+
+/// Whether a rule reads the nets: a net-aware check, or any rule gated on `net`.
+pub fn net_aware(rule: &pdk::RuleDefinition) -> bool {
+    NET_AWARE_CHECKS.contains(&rule.check.as_str()) || rule.params.contains_key("net")
+}
 
 /// Parse a lazy virtual layer's `op` string to a [`merge::VirtualOp`], converting its
-/// radius (µm) to DBU where the op takes one.  An unsupported op or a missing radius is
-/// an error: the layer would otherwise silently register as empty and every rule
+/// distances (µm) to DBU where the op takes them.  An unsupported op or a missing radius
+/// is an error: the layer would otherwise silently register as empty and every rule
 /// referencing it would become a no-op false-clean.
+///
+/// Op names follow KLayout's, including its distinction between `overlapping` (shares
+/// positive area) and `interacting` (shares area *or* merely touches) — they differ only
+/// on zero-area contact, and picking the wrong one is a silent correctness bug, so both
+/// exist under the names a rule author reading the foundry deck will expect.
 pub fn parse_virtual_op(
     op: &str,
     radius: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+    slack: Option<f64>,
     dbu_to_um: f64,
 ) -> Result<merge::VirtualOp, String> {
     use merge::VirtualOp::*;
@@ -54,25 +189,813 @@ pub fn parse_virtual_op(
             .map(|r| (r / dbu_to_um).round() as i32)
             .ok_or_else(|| format!("op '{op}' requires a radius"))
     };
+    let to_dbu = |v: Option<f64>| v.map(|x| (x / dbu_to_um).round() as i32);
+    // Neighbour counts for the region selectors: whole numbers, and a minimum below one is
+    // a selector that keeps everything, which is a deck bug rather than a rule.
+    let counts = || -> Result<(Option<u32>, Option<u32>), String> {
+        for (v, which) in [(min, "min"), (max, "max")] {
+            if let Some(v) = v
+                && (v < 1.0 || v.fract() != 0.0)
+            {
+                return Err(format!(
+                    "op '{op}' takes a whole `{which}` count of 1 or more"
+                ));
+            }
+        }
+        Ok((min.map(|v| v as u32), max.map(|v| v as u32)))
+    };
+    let bounds = || -> Result<(Option<i32>, Option<i32>), String> {
+        if min.is_none() && max.is_none() {
+            return Err(format!("op '{op}' requires a `min` and/or `max` bound"));
+        }
+        Ok((to_dbu(min), to_dbu(max)))
+    };
     Ok(match op {
         "union" => Union,
         "intersection" | "and" => Intersection,
         "difference" | "not" => Difference,
         "square" => Square,
         "not_square" => NotSquare,
-        "interacting" => Interacting,
-        "not_interacting" => NotInteracting,
-        "covering" => Covering,
+        "rectangle" => Rectangle,
+        "not_rectangle" => NotRectangle,
+        // KLayout `overlapping` / `not_outside` — positive shared area only.
+        //
+        // The selectors take `min`/`max` as KLayout's inclusive neighbour *counts*, not as
+        // a measurement: `interacting` with `min: 2, max: 2` is `interacting(other, 2, 2)`.
+        // Absent bounds are the uncounted form, "at least one".
+        "overlapping" | "not_outside" => {
+            let (a, b) = counts()?;
+            Overlapping(a, b)
+        }
+        "not_overlapping" | "outside" => {
+            let (a, b) = counts()?;
+            NotOverlapping(a, b)
+        }
+        // KLayout `interacting` — shared area *or* zero-area contact.
+        "interacting" => {
+            let (a, b) = counts()?;
+            Interacting(a, b)
+        }
+        "not_interacting" => {
+            let (a, b) = counts()?;
+            NotInteracting(a, b)
+        }
+        "inside" => Inside,
+        "not_inside" => NotInside,
+        "covering" => {
+            let (a, b) = counts()?;
+            Covering(a, b)
+        }
+        "not_covering" => {
+            let (a, b) = counts()?;
+            NotCovering(a, b)
+        }
         "not_circle_or_octagon" => NotCircleOrOctagon,
         "not_circle" => NotCircle,
         "holes" => Holes,
         "with_holes" => WithHoles,
         "with_text" => WithText,
+        "extents" => Extents,
+        "with_area" => {
+            if min.is_none() && max.is_none() {
+                return Err(format!("op '{op}' requires a `min` and/or `max` bound"));
+            }
+            // Bounds are um^2 in the deck and DBU^2 here, so the conversion squares.
+            let to_dbu2 = |v: Option<f64>| v.map(|x| (x / (dbu_to_um * dbu_to_um)).round() as i64);
+            WithArea(to_dbu2(min), to_dbu2(max))
+        }
+        "with_bbox_min" => {
+            let (lo, hi) = bounds()?;
+            WithBBoxMin(lo, hi)
+        }
+        "with_bbox_max" => {
+            let (lo, hi) = bounds()?;
+            WithBBoxMax(lo, hi)
+        }
+        "enclosure_above" => {
+            let v = min.ok_or_else(|| format!("virtual op '{op}' requires a `min`"))?;
+            EnclosureAbove((v / dbu_to_um).round() as i32)
+        }
+        "enclosure_below" => {
+            let v = max.ok_or_else(|| format!("virtual op '{op}' requires a `max`"))?;
+            EnclosureBelow((v / dbu_to_um).round() as i32)
+        }
+        "separation_below" => {
+            let v = max.ok_or_else(|| format!("virtual op '{op}' requires a `max`"))?;
+            SeparationBelow((v / dbu_to_um).round() as i32)
+        }
         "close" => Close(radius_dbu()?),
         "open" => Open(radius_dbu()?),
-        "grow" => Grow(radius_dbu()?),
+        // Slack is opt-in; see `VirtualLayerDef::slack` for the one case that wants it.
+        "grow" => Grow(
+            radius_dbu()?,
+            slack.map_or(0, |m| (m / dbu_to_um).round() as i32),
+        ),
+        "grow_round" => GrowRound(
+            radius_dbu()?,
+            slack.map_or(0, |m| (m / dbu_to_um).round() as i32),
+        ),
+        "shrink" => Shrink(radius_dbu()?),
+        "grow_x" => GrowX(radius_dbu()?),
+        "grow_y" => GrowY(radius_dbu()?),
+        "shrink_x" => ShrinkX(radius_dbu()?),
+        "shrink_y" => ShrinkY(radius_dbu()?),
         other => return Err(format!("unsupported op '{other}'")),
     })
+}
+
+/// Parse an edge layer's `op` string to a [`merge::EdgeOp`].  `min`/`max` carry the
+/// op's bounds — µm for the length filters, degrees for the angle ones.
+pub fn parse_edge_op(
+    op: &str,
+    min: Option<f64>,
+    max: Option<f64>,
+    fraction: Option<f64>,
+    dbu_to_um: f64,
+) -> Result<merge::EdgeOp, String> {
+    use merge::EdgeOp::*;
+    let to_dbu = |v: Option<f64>| v.map(|x| (x / dbu_to_um).round() as i32);
+    let bounds = || -> Result<(Option<i32>, Option<i32>), String> {
+        if min.is_none() && max.is_none() {
+            return Err(format!(
+                "edge op '{op}' requires a `min` and/or `max` bound"
+            ));
+        }
+        Ok((to_dbu(min), to_dbu(max)))
+    };
+    let angles = || -> Result<(i32, i32), String> {
+        match (min, max) {
+            (Some(a), Some(b)) => Ok((a.round() as i32, b.round() as i32)),
+            _ => Err(format!(
+                "edge op '{op}' requires both `min` and `max` in degrees"
+            )),
+        }
+    };
+    Ok(match op {
+        "edges" => Edges,
+        "and" => And,
+        "not" => Not,
+        "or" | "join" => Or,
+        "inside_part" => InsidePart,
+        "outside_part" => OutsidePart,
+        // Whole-edge selection: keeps or drops each segment entire, where the `_part`
+        // ops cut it at the boundary.
+        "interacting" => Interacting,
+        "not_interacting" => NotInteracting,
+        "interacting_edges" => InteractingEdges,
+        "not_interacting_edges" => NotInteractingEdges,
+        // `centers(length, fraction)`: `min` is the absolute length in µm, `fraction` the
+        // relative one, and KLayout keeps whichever is longer.  Neither given would keep
+        // the edge entire, which is not what any deck means by asking for its centre.
+        "width_below" => {
+            let v = max.ok_or_else(|| format!("edge op '{op}' requires a `max`"))?;
+            merge::EdgeOp::WidthBelow((v / dbu_to_um).round() as i32)
+        }
+        "centers" => {
+            if min.is_none() && fraction.is_none() {
+                return Err(format!("edge op '{op}' requires a `min` and/or `fraction`"));
+            }
+            if let Some(f) = fraction
+                && !(0.0..=1.0).contains(&f)
+            {
+                return Err(format!(
+                    "edge op '{op}' takes a `fraction` in 0..1, got {f}"
+                ));
+            }
+            Centers(
+                to_dbu(min).unwrap_or(0),
+                fraction.map_or(0, |f| (f * 1000.0).round() as i32),
+            )
+        }
+        "with_length" => {
+            let (lo, hi) = bounds()?;
+            WithLength(lo, hi)
+        }
+        "without_length" => {
+            let (lo, hi) = bounds()?;
+            WithoutLength(lo, hi)
+        }
+        "with_angle" => {
+            let (lo, hi) = angles()?;
+            WithAngle(lo, hi)
+        }
+        "without_angle" => {
+            let (lo, hi) = angles()?;
+            WithoutAngle(lo, hi)
+        }
+        other => return Err(format!("unsupported edge op '{other}'")),
+    })
+}
+
+/// A reach along each axis, in DBU.  A halo is one number - the tiles are square - but
+/// a derivation's reach is not: `shrink_y 15` reads fifteen micrometres up and down and
+/// nothing sideways.  Summing the four directional sizes of GF180's slotting opening as
+/// four isotropic reaches charged its drawn metal twice what the opening reads, and
+/// every layer feeding it the same.  The axes are tracked apart and the halo is the
+/// larger of the two at the end.
+type Reach = (i32, i32);
+
+/// One relaxation pass of the virtual-layer halo propagation: push each tiled virtual's
+/// own halo (plus its op's intrinsic reach) onto its sources.  Called repeatedly to a
+/// fixed point by [`halo_table`], because virtuals chain and a single pass moves a halo only
+/// one link.  A virtual outside `in_scope` neither needs building nor propagates.
+///
+/// A lazy virtual is composed from its sources' tiles, so each source needs at least the
+/// virtual's own halo (the result keeps only what the sources covered).  A `close`
+/// dilates then erodes by its radius, so its source needs 2·r more to be exact in the
+/// core; a `grow` only dilates, so 1·r.  The radius part is charged even when no distance
+/// rule reads the virtual - a grow feeding a `forbidden` chain still needs its source
+/// within reach to be right per tile.
+/// How many bytes the merge cache may hold between rules: `GDSCHECK_CACHE_BYTES` when
+/// set, else half of what the run's memory limit leaves after `resident` bytes - the
+/// flattened layout and the nets, which stay for the whole run.  Planned once the
+/// resident part is known, so a 12 GB container with 7 GB resident plans 2.5 GB of
+/// cache, not a quarter of the machine it happens to run on.
+fn cache_budget_bytes(limit: &memory::Limit, resident: u64) -> usize {
+    if let Some(v) = std::env::var("GDSCHECK_CACHE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return v;
+    }
+    memory::cache_budget_bytes(limit, resident)
+}
+
+/// `--stats`: the shapes of every drawn layer the run flattened, largest first, with
+/// the memory limit and what is resident once the layout is flattened.  The layer that
+/// is a hundred times the others is where a slow or killed run starts.
+fn print_stats(
+    pdk: &pdk::PdkConfig,
+    layout: &layout::FlatLayout,
+    rules: &[pdk::RuleDefinition],
+    limit: &memory::Limit,
+) {
+    let mut rows: Vec<(usize, String, (u16, u16))> = pdk
+        .layers()
+        .map(|(name, l)| {
+            (
+                layout.get(l.gds_layer as i16, l.gds_datatype as i16).len(),
+                name.to_string(),
+                (l.gds_layer, l.gds_datatype),
+            )
+        })
+        .filter(|r| r.0 > 0)
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let total: usize = rows.iter().map(|r| r.0).sum();
+    println!(
+        "Layers flattened for {} rules ({total} shapes):",
+        rules.len()
+    );
+    for (shapes, name, (l, d)) in &rows {
+        println!("  {shapes:>12}  {name} ({l}/{d})");
+    }
+    println!(
+        "Memory: planning within {:.1} GB ({}), {:.1} GB resident with the layout flattened",
+        memory::gb(limit.bytes),
+        limit.source,
+        memory::gb(memory::rss_bytes())
+    );
+}
+
+/// What building a rule's layers would add to the merge cache, in bytes: every drawn
+/// layer of its closure not cached at the halo it needs, at its shape count times what
+/// the tile and halo multiply it by - a shape lies in `(1 + 2h/t)²` tiles - at what a
+/// copy of its shapes takes ([`layout::Shapes::copy_bytes`]).  A
+/// clippable layer is left out: it is built only round the rule's own geometry, not
+/// over the chip.  The derived layers built from the drawn ones are not counted; the
+/// estimate is for telling the rule that is out of the question (a contact layer at a
+/// 60 µm halo: 176 million copies, 44 GB) from the one that is not (MDN.4b: comp and
+/// poly at 50 µm, 9 GB by this count, 3 GB in the run).
+fn rule_estimate_bytes(
+    halos: &merge::RuleHalos,
+    layout: &layout::FlatLayout,
+    merged: &merge::MergedCache,
+    clippable: &std::collections::HashSet<(i16, i16)>,
+    tile_dbu: i32,
+    halo_dbu: i32,
+) -> u64 {
+    let (table, closure) = halos;
+    closure
+        .iter()
+        .filter(|k| merged.is_drawn(**k) && !clippable.contains(k))
+        .map(|k| {
+            let need = table.get(k).copied().unwrap_or(halo_dbu);
+            if merged.cached_halo(*k).is_some_and(|h| h >= need) {
+                return 0;
+            }
+            let shapes = layout.get(k.0, k.1);
+            let f = 1.0 + 2.0 * need as f64 / tile_dbu as f64;
+            (shapes.len() as f64 * f * f * shapes.copy_bytes()) as u64
+        })
+        .sum()
+}
+
+/// The polygon copies building a rule's layers would make: [`rule_estimate_bytes`]'s
+/// layers, counted in copies, for the working set a rule's check builds around them.
+fn rule_copies_to_build(
+    halos: &merge::RuleHalos,
+    layout: &layout::FlatLayout,
+    merged: &merge::MergedCache,
+    clippable: &std::collections::HashSet<(i16, i16)>,
+    tile_dbu: i32,
+    halo_dbu: i32,
+) -> u64 {
+    let (table, closure) = halos;
+    closure
+        .iter()
+        .filter(|k| merged.is_drawn(**k) && !clippable.contains(k))
+        .map(|k| {
+            let need = table.get(k).copied().unwrap_or(halo_dbu);
+            if merged.cached_halo(*k).is_some_and(|h| h >= need) {
+                return 0;
+            }
+            let f = 1.0 + 2.0 * need as f64 / tile_dbu as f64;
+            (layout.get(k.0, k.1).len() as f64 * f * f) as u64
+        })
+        .sum()
+}
+
+fn propagate_virtual_halos(
+    tiled_virtuals: &[(pdk::TiledVirtualSpec, merge::VirtualOp)],
+    in_scope: Option<&std::collections::HashSet<(i16, i16)>>,
+    clippable: &std::collections::HashSet<(i16, i16)>,
+    halo_by_layer: &mut std::collections::HashMap<(i16, i16), Reach>,
+    why: &mut std::collections::HashMap<(i16, i16), String>,
+    tile_dbu: i32,
+) {
+    for (spec, op) in tiled_virtuals {
+        // A virtual the deck never reads costs nothing to build, but its halo would
+        // still be charged to its sources - and those sources may well be layers this
+        // deck does read.  GF180's slotting chain is eight sizing operators deep, so
+        // leaving it in scope would put a 120 um halo on the drawn metal of every deck
+        // in the PDK.  Only virtuals in the run's layer closure propagate.
+        if in_scope.is_some_and(|n| !n.contains(&spec.key)) {
+            continue;
+        }
+        let extra: Reach = match op {
+            // An erosion large against the tile is read on stitched regions and asks
+            // its source for nothing (see `merge::erosion_on_regions`).
+            merge::VirtualOp::Open(r)
+            | merge::VirtualOp::Shrink(r)
+            | merge::VirtualOp::ShrinkX(r)
+            | merge::VirtualOp::ShrinkY(r)
+                if merge::erosion_on_regions(*r, tile_dbu) =>
+            {
+                (0, 0)
+            }
+            merge::VirtualOp::Close(r) | merge::VirtualOp::Open(r) => (2 * r, 2 * r),
+            // Reads to the far side of the gap it measures.
+            merge::VirtualOp::SeparationBelow(r)
+            | merge::VirtualOp::EnclosureBelow(r)
+            | merge::VirtualOp::EnclosureAbove(r) => (*r, *r),
+            // With its slack: a grow of nothing but the slack reaches a grid step past
+            // its source, and a source cut at the tile line one step short of a shape
+            // it was meant to overlap left the shape unselected in the tile beyond.
+            merge::VirtualOp::Grow(r, slack) | merge::VirtualOp::GrowRound(r, slack) => {
+                (*r + *slack, *r + *slack)
+            }
+            // A directional size reads geometry up to `r` away along its axis only -
+            // an erode dilates the complement by that much, a dilate the shape.  An
+            // isotropic erode reads the same distance in every direction.
+            merge::VirtualOp::GrowX(r) | merge::VirtualOp::ShrinkX(r) => (*r, 0),
+            merge::VirtualOp::GrowY(r) | merge::VirtualOp::ShrinkY(r) => (0, *r),
+            merge::VirtualOp::Shrink(r) => (*r, *r),
+            // `holes`/`with_holes` read the stitched region, so a ring of any size has
+            // its hole without the source holding the whole ring in one tile.
+            _ => (0, 0),
+        };
+        // A layer delivered as core-clipped pieces (see `clippable_layers`) only has to
+        // be exact in its core, so its sources owe it its own reach and nothing of what
+        // its consumers ask of it; that part is met by copying the pieces outward.
+        let own = if clippable.contains(&spec.key) {
+            (0, 0)
+        } else {
+            halo_by_layer.get(&spec.key).copied().unwrap_or((0, 0))
+        };
+        let need = (own.0 + extra.0, own.1 + extra.1);
+        if need == (0, 0) {
+            continue;
+        }
+        for src in &spec.sources {
+            let e = halo_by_layer.entry(*src).or_insert((0, 0));
+            if need.0 > e.0 || need.1 > e.1 {
+                *e = (e.0.max(need.0), e.1.max(need.1));
+                let via = why
+                    .get(&spec.key)
+                    .map(|w| format!(" <- {w}"))
+                    .unwrap_or_default();
+                why.insert(*src, format!("{}{via}", spec.name));
+            }
+        }
+    }
+}
+
+/// The checks whose value is a distance the merge has to see across a tile edge.
+///
+/// Every check that measures *between* shapes belongs here, whatever else gates it: the
+/// net-aware spacings, the parallel-run and bent variants, the array spacing, the
+/// extension and overlap and endcap margins, the erosion `wide_uncovered` runs.  For a
+/// long time only the plain eight were listed, and the rest worked because some other
+/// rule on the same layers had raised the halo to cover them - LPW.2a's 1.4 µm
+/// different-net spacing rode on LPW.3's 2.5 µm.  A halo built per rule has no such
+/// luck to ride on, which is how the omission showed: three foundry violations at
+/// 1.395 µm gone, under a 1 µm halo.
+///
+/// `max_space` is not here, save for its `scope: edge` (see [`dist_check`]): it reads
+/// both layers as core pieces and finds the reference within its value of a core in the
+/// neighbouring tiles itself (see `merge::max_space_gaps`).  Listed, its 20 µm was the
+/// halo of Activ on an ORFS layout, and the merge died in it.
+const DIST_CHECKS: &[&str] = &[
+    // Width.
+    "min_width",
+    "max_width",
+    "exact_width",
+    "min_gate_length",
+    "max_gate_length",
+    "exact_gate_length",
+    // Space.
+    "min_space",
+    "min_notch",
+    "min_overlap",
+    // Enclosure.
+    "min_enclosure",
+    "max_enclosure",
+    // Shape.  A polygon's own extent: the copy in its tile has to be whole up to the
+    // value, or a long shape cut at the tile line is read as several short ones.
+    // MDN.13a's 50 µm `max_length` never fired once its body was built from clipped
+    // pieces.
+    "min_dim",
+    "max_dim",
+    "exact_dim",
+    "min_length",
+    "max_length",
+    "exact_length",
+    "min_edge_length",
+    "wide_uncovered",
+];
+
+/// Whether a rule measures a distance and so wants its value as the halo of the layers it
+/// reaches: the checks above, and a `max_space` read per edge, whose edges are not
+/// clipped to a tile and whose partner it gathers by the value around each.
+fn dist_check(rule: &pdk::RuleDefinition) -> bool {
+    DIST_CHECKS.contains(&rule.check.as_str())
+        || (rule.check == "max_space" && rule.word("scope") == Some("edge"))
+}
+
+/// The checks that read a polygon's own shape - its holes, its corners, its area - and
+/// so need the tile's copy whole a little past the core.
+const SHAPE_CHECKS: &[&str] = &[
+    // Shape.
+    "no_corner",
+    "no_hole",
+    "no_ring",
+    "ring_covers_boundary",
+    // Area.
+    "min_area",
+    "max_area",
+    "exact_area",
+];
+
+/// A halo per layer (DBU), and for each the rule or derivation chain that set it.
+type HaloTable = (
+    std::collections::HashMap<(i16, i16), i32>,
+    std::collections::HashMap<(i16, i16), String>,
+);
+
+/// The halo each layer needs so that `rules` are exact per tile, and why.
+///
+/// A rule seeds the layers it names with its own reach; a derivation charges its sources
+/// what it reaches on top of what is asked of it, run to a fixed point along the chains;
+/// an edge layer cut from a measurement reads as far as the measurement does.  Layers
+/// nothing raises are absent, and a reader takes its own floor for them.
+///
+/// Called once over every rule for the configured maxima - what `GDSCHECK_DUMP_HALO`
+/// prints, and what a layer a rule reaches only incidentally gets - and once per rule
+/// over that rule alone, which is what its merges are built at.  The first is a maximum
+/// over every consumer of a layer, and on a real design one long-reach chain on a dense
+/// layer (a 200 um guard-ring `holes` on the actives, the slotting opening on the vias)
+/// made every other rule on it pay for that reach: Contact at 60 um is 175 million
+/// polygon copies from 3.6 million shapes, for a rule that measures 70 nm.
+#[allow(clippy::too_many_arguments)]
+fn halo_table(
+    rules: &[&pdk::RuleDefinition],
+    in_scope: Option<&std::collections::HashSet<(i16, i16)>>,
+    clippable: &std::collections::HashSet<(i16, i16)>,
+    tiled_virtuals: &[(pdk::TiledVirtualSpec, merge::VirtualOp)],
+    edge_specs: &[pdk::TiledEdgeSpec],
+    is_empty_base: &dyn Fn(&pdk::Layer) -> bool,
+    halo_dbu: i32,
+    tile_dbu: i32,
+    dbu_to_um: f64,
+) -> HaloTable {
+    let mut halo: std::collections::HashMap<(i16, i16), Reach> = std::collections::HashMap::new();
+    let mut why: std::collections::HashMap<(i16, i16), String> = std::collections::HashMap::new();
+    // A check that reads a polygon's own shape - its holes, its corners, its area -
+    // needs the tile's copy whole a little past the core, which a merge of whole copies
+    // always gave and a layer built from clipped pieces gives only when something
+    // asked; those seed the minimum.  A distance check seeds its value.  A check that
+    // stitches regions or takes a boolean residual asks nothing of the tiles beyond the
+    // core, and seeding it anyway made a layer copied out that never was, promoting a
+    // neighbour's slack into a second Rsil.c marker.
+    for rule in rules.iter() {
+        let dist = dist_check(rule);
+        if !dist && !SHAPE_CHECKS.contains(&rule.check.as_str()) {
+            continue;
+        }
+        // A spacing rule between two layers can only fire if *both* are present, so an
+        // empty partner must not inflate the other's halo.  In a combined run (the full
+        // suite) `min_space [LBE, Activ] = 30 µm` would otherwise give the dense Activ a
+        // 30 µm halo on a chip that has no LBE at all - a ~100 GB tiled merge for a rule
+        // that cannot produce a single violation.  (Only base/global layers are checked;
+        // a lazy virtual isn't materialised yet, so it is conservatively treated as
+        // non-empty - the inflating rules in practice reference base layers.)
+        let inflating = matches!(rule.check.as_str(), "min_space" | "min_notch")
+            && rule.layers.iter().any(is_empty_base);
+        // `wide_uncovered` erodes by reading the neighbouring tiles itself, and the
+        // extent checks measure stitched regions; neither asks anything of the halo.
+        // A value-sized one put Metal1 at 30 µm for Slt.c and COMP at 50 µm for
+        // MDP.13a's `max_length`.
+        let dist = dist
+            && !matches!(
+                rule.check.as_str(),
+                "wide_uncovered"
+                    | "min_dim"
+                    | "max_dim"
+                    | "exact_dim"
+                    | "min_length"
+                    | "max_length"
+                    | "exact_length"
+            );
+        let h = if dist && !inflating {
+            (merge::MIN_HALO_UM.max(rule.value) / dbu_to_um).ceil() as i32
+        } else {
+            halo_dbu
+        };
+        for l in &rule.layers {
+            let key = (l.gds_layer as i16, l.gds_datatype as i16);
+            let e = halo.entry(key).or_insert((0, 0));
+            if h > e.0 || h > e.1 {
+                *e = (e.0.max(h), e.1.max(h));
+                why.insert(key, format!("rule {}", rule.id));
+            }
+        }
+    }
+    // Virtuals chain, and a chain's reach is the sum of its links.  A single pass in
+    // declaration order only ever moves a halo one link, and only when the deck happens
+    // to declare the consumer first, so this runs to a fixed point instead.  Halos only
+    // ever grow, and each pass that changes nothing ends it; the virtual graph is
+    // acyclic, so it terminates.
+    //
+    // Edge layers chain the same way and are walked in the same loop: an edge layer
+    // owes its sources its own reach - a 50 µm `max_width` on gate-end edges checks
+    // that the span lies inside the polygon they were cut from, fifty microns out -
+    // plus what its op reads (a measurement, as far as it measures), and never less
+    // than the minimum for a polygon source, whose boundary has to be the region's a
+    // little past the core and not a tile's.
+    loop {
+        let before = halo.clone();
+        propagate_virtual_halos(
+            tiled_virtuals,
+            in_scope,
+            clippable,
+            &mut halo,
+            &mut why,
+            tile_dbu,
+        );
+        for spec in edge_specs {
+            if in_scope.is_some_and(|n| !n.contains(&spec.key)) {
+                continue;
+            }
+            let own = halo.get(&spec.key).copied().unwrap_or((0, 0));
+            let extra = match (spec.op.as_str(), spec.max) {
+                ("width_below", Some(v)) => (v / dbu_to_um).ceil() as i32,
+                _ => 0,
+            };
+            let need = (own.0 + extra).max(halo_dbu);
+            let need = (need, (own.1 + extra).max(halo_dbu));
+            for src in &spec.sources {
+                let e = halo.entry(*src).or_insert((0, 0));
+                if need.0 > e.0 || need.1 > e.1 {
+                    *e = (e.0.max(need.0), e.1.max(need.1));
+                    let via = why
+                        .get(&spec.key)
+                        .map(|w| format!(" <- {w}"))
+                        .unwrap_or_default();
+                    why.insert(*src, format!("edge layer {}{via}", spec.name));
+                }
+            }
+        }
+        if halo == before {
+            break;
+        }
+    }
+    let halo = halo
+        .into_iter()
+        .map(|(k, (x, y))| (k, x.max(y).max(halo_dbu)))
+        .collect();
+    (halo, why)
+}
+
+type LayerSet = std::collections::HashSet<(i16, i16)>;
+
+/// The derived layers that can be handed to their consumers as core-clipped pieces.
+///
+/// A tile's copy of a derived layer is exact in the core and trails off beyond it, so a
+/// consumer that reads across a tile edge needs the copy to be exact that far, and the
+/// layer's sources further still: a chain of eight 15 µm sizes charged its drawn metal
+/// 60 µm, and the vias under it 30 µm, for a rule that reads nothing across a tile edge
+/// at all.  Cutting each tile's result to its core and copying the pieces to the tiles
+/// within the consumers' reach delivers exactly that reach from a layer that was only
+/// ever exact in its core - so its sources owe it its own operator's reach and no more,
+/// and the chain stops accumulating.
+///
+/// Pieces are a region only to a consumer that reads them as one.  A boolean unions
+/// them; a size unions them first (see `shrink`); a selection stitches them along the
+/// cuts, and a region filter sums their areas.  Anything that looks at a polygon on its
+/// own - a rectangle or circle filter, an edge cut, a rule measuring a wall - would see
+/// the cuts, and a layer with such a consumer stays whole.  A hole finder, an extents
+/// box and a `covering` read the stitched region, pieces and all.  A selection or
+/// region filter passes its candidate's pieces straight through to its own output, so it
+/// qualifies only if it qualifies itself, which is why this runs to a fixed point.
+fn clippable_layers(
+    tiled_virtuals: &[(pdk::TiledVirtualSpec, merge::VirtualOp)],
+    edge_specs: &[pdk::TiledEdgeSpec],
+    rules: &[pdk::RuleDefinition],
+) -> (LayerSet, LayerSet) {
+    use merge::VirtualOp as O;
+    let reads_as_region = |op: O| {
+        matches!(
+            op,
+            O::Union
+                | O::Intersection
+                | O::Difference
+                | O::Overlapping(_, _)
+                | O::NotOverlapping(_, _)
+                | O::Interacting(_, _)
+                | O::NotInteracting(_, _)
+                | O::Inside
+                | O::NotInside
+                | O::Covering(_, _)
+                | O::NotCovering(_, _)
+                | O::Grow(_, _)
+                | O::GrowRound(_, _)
+                | O::GrowX(_)
+                | O::GrowY(_)
+                | O::Shrink(_)
+                | O::ShrinkX(_)
+                | O::ShrinkY(_)
+                | O::Close(_)
+                | O::Open(_)
+                | O::WithArea(_, _)
+                | O::WithBBoxMin(_, _)
+                | O::WithBBoxMax(_, _)
+                | O::Rectangle
+                | O::NotRectangle
+                | O::Square
+                | O::NotSquare
+                | O::Holes
+                | O::WithHoles
+                | O::Extents
+        )
+    };
+    let passes_through = |op: O| {
+        matches!(
+            op,
+            O::Overlapping(_, _)
+                | O::NotOverlapping(_, _)
+                | O::Interacting(_, _)
+                | O::NotInteracting(_, _)
+                | O::Inside
+                | O::NotInside
+                | O::Covering(_, _)
+                | O::NotCovering(_, _)
+                | O::WithArea(_, _)
+                | O::WithBBoxMin(_, _)
+                | O::WithBBoxMax(_, _)
+                | O::Rectangle
+                | O::NotRectangle
+                | O::Square
+                | O::NotSquare
+        )
+    };
+    let mut read_whole: std::collections::HashSet<(i16, i16)> = rules
+        .iter()
+        .flat_map(|r| {
+            r.layers
+                .iter()
+                .map(|l| (l.gds_layer as i16, l.gds_datatype as i16))
+        })
+        .collect();
+    for spec in edge_specs {
+        read_whole.extend(spec.sources.iter().copied());
+    }
+    // Pieces are for readers that work on regions.  Anything that reads a polygon copy
+    // as a polygon is built the old way, whole copies down to the drawn layers - never
+    // clipped, never cut at the zone when copied out, and a selection feeding another
+    // layer left without copies - and so is everything upstream of it, since a layer
+    // built from pieces is itself in pieces.  That is every check that measures or
+    // reads a shape: a wall the tiles have cut into per-tile fragments is reported once
+    // per fragment, where whole copies gave every tile the identical wall and the
+    // report folded them to one (CUP.2 on a millimetre of 0.3 µm metal went from one
+    // marker to fifty).  It is the enclosure engine, which tests every vertex of the
+    // enclosed shape against the copy of the enclosing layer in the tile that owns the
+    // shape - right only when the copy happens to extend over the other shape, which
+    // whole copies of drawn geometry do (MIMTM.3 encloses a sixty-micron fuse window
+    // in a derived plate).  And it is an edge cut, whose segments feed the edge
+    // checks.  `covering` used to be here for the same reason and is not any more: it
+    // asks per core whether the filter's piece lies within the candidate's, which is
+    // exact on pieces, and on a whole copy of a boolean over a chip-sized operand it
+    // was wrong.  What is left for pieces is a chain that ends in a `forbidden`, a coverage
+    // residual, an area or a density - and the slotting chains, the ones that cost
+    // the most, are exactly that.
+    let mut sources_of: std::collections::HashMap<(i16, i16), &[(i16, i16)]> =
+        std::collections::HashMap::new();
+    for (spec, _) in tiled_virtuals {
+        sources_of.insert(spec.key, &spec.sources);
+    }
+    let reads_polygons = |r: &pdk::RuleDefinition| {
+        dist_check(r)
+            || SHAPE_CHECKS.contains(&r.check.as_str())
+            || matches!(r.check.as_str(), "no_angle" | "offgrid")
+    };
+    let mut stack: Vec<(i16, i16)> = rules
+        .iter()
+        .filter(|r| reads_polygons(r))
+        .flat_map(|r| {
+            r.layers
+                .iter()
+                .map(|l| (l.gds_layer as i16, l.gds_datatype as i16))
+        })
+        .collect();
+    for spec in edge_specs {
+        stack.extend(spec.sources.iter().copied());
+    }
+    let mut whole_chain: std::collections::HashSet<(i16, i16)> = std::collections::HashSet::new();
+    while let Some(k) = stack.pop() {
+        if !whole_chain.insert(k) {
+            continue;
+        }
+        if let Some(srcs) = sources_of.get(&k) {
+            stack.extend(srcs.iter().copied());
+        }
+    }
+    read_whole.extend(whole_chain.iter().copied());
+    // Every consumer of each layer: the consumer's op, and whether the layer is the
+    // candidate it passes through.
+    type Consumer = ((i16, i16), merge::VirtualOp, bool);
+    let mut consumers: std::collections::HashMap<(i16, i16), Vec<Consumer>> =
+        std::collections::HashMap::new();
+    for (spec, op) in tiled_virtuals {
+        for (i, src) in spec.sources.iter().enumerate() {
+            consumers
+                .entry(*src)
+                .or_default()
+                .push((spec.key, *op, i == 0 && passes_through(*op)));
+        }
+    }
+    let mut ok: std::collections::HashSet<(i16, i16)> = tiled_virtuals
+        .iter()
+        .filter(|(spec, _)| !read_whole.contains(&spec.key))
+        .filter(|(spec, _)| {
+            consumers.get(&spec.key).is_some_and(|cs| {
+                !cs.is_empty() && cs.iter().all(|(_, op, _)| reads_as_region(*op))
+            })
+        })
+        .map(|(spec, _)| spec.key)
+        .collect();
+    loop {
+        let before = ok.len();
+        let snapshot = ok.clone();
+        ok.retain(|key| {
+            consumers[key]
+                .iter()
+                .all(|(consumer, _, through)| !through || snapshot.contains(consumer))
+        });
+        if ok.len() == before {
+            break;
+        }
+    }
+    (ok, whole_chain)
+}
+
+/// Every layer `seeds` reach through the derivation graph: the seeds, their sources,
+/// and so on down to the drawn layers.
+fn layer_closure(
+    seeds: impl IntoIterator<Item = (i16, i16)>,
+    sources_of: &std::collections::HashMap<(i16, i16), Vec<(i16, i16)>>,
+) -> std::collections::HashSet<(i16, i16)> {
+    let mut out = std::collections::HashSet::new();
+    let mut stack: Vec<(i16, i16)> = seeds.into_iter().collect();
+    while let Some(k) = stack.pop() {
+        if !out.insert(k) {
+            continue;
+        }
+        if let Some(srcs) = sources_of.get(&k) {
+            stack.extend(srcs.iter().copied());
+        }
+    }
+    out
 }
 
 /// Run DRC for a selection of rules: either one or more decks (`decks`, suite-free
@@ -87,6 +1010,145 @@ pub fn run_drc(
     topcell: &str,
     connectivity: bool,
 ) -> Result<Vec<Violation>, String> {
+    run_drc_impl(
+        LibSource::Path(gds_path),
+        process,
+        decks,
+        suite,
+        topcell,
+        connectivity,
+        &RunOptions::default(),
+    )
+}
+
+/// What a run may be tuned by, beyond what it checks.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    /// The tile the merge cache works in, in µm.  Every layer is merged, stitched and
+    /// measured per tile of this size with a halo round it; a smaller tile bounds memory
+    /// tighter and cuts the geometry into more pieces, a larger one holds more of a
+    /// dense layer whole and copies less of it into halos.  [`merge::TILE_UM`] is the
+    /// default, and what the engine patterns are drawn against.
+    pub tile_um: f64,
+    /// What the run may take of memory, in bytes, when the caller says: `--memory`,
+    /// `GDSCHECK_MEMORY`.  Else it is read from the cgroup or the machine, less a tenth
+    /// (see [`memory::limit`]).
+    pub memory_limit: Option<u64>,
+    /// Stop after the layout is flattened and say what the run would take: the shapes
+    /// of every layer the rules read, largest first, the memory limit and what is
+    /// resident then - where to start when a run is killed or slow.
+    pub stats: bool,
+}
+
+impl Default for RunOptions {
+    /// [`merge::TILE_UM`], or `GDSCHECK_TILE_UM` when set: the tile a run reads by
+    /// default, and the way to run the whole test suite at another tile - a result that
+    /// depends on where the tile lines fall is a defect, and every fixture asks that at
+    /// once under `GDSCHECK_TILE_UM=7 cargo test`.
+    fn default() -> Self {
+        let tile_um = std::env::var("GDSCHECK_TILE_UM")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(merge::TILE_UM);
+        let memory_limit = std::env::var("GDSCHECK_MEMORY")
+            .ok()
+            .and_then(|v| memory::parse_size(&v).ok());
+        RunOptions {
+            tile_um,
+            memory_limit,
+            stats: false,
+        }
+    }
+}
+
+/// Where a run's library comes from: read here, or handed over already read.
+enum LibSource<'a> {
+    Path(&'a str),
+    Loaded(&'a GdsLibrary),
+    Owned(GdsLibrary),
+}
+
+/// [`run_drc`] over a library already in memory.  The command line reads the file once
+/// to print its name and validate the top cell, and read it a second time in here: two
+/// gunzips and two parses of a 14 MB file, nine seconds of a run's start on one core.
+pub fn run_drc_with(
+    lib: &GdsLibrary,
+    process: &str,
+    decks: &[&str],
+    suite: Option<&str>,
+    topcell: &str,
+    connectivity: bool,
+) -> Result<Vec<Violation>, String> {
+    run_drc_with_options(
+        lib,
+        process,
+        decks,
+        suite,
+        topcell,
+        connectivity,
+        &RunOptions::default(),
+    )
+}
+
+/// [`run_drc_with_options`] over a library the run may have: it is dropped once the
+/// layout is flattened, and what the hierarchy held is the run's again.
+pub fn run_drc_owned(
+    lib: GdsLibrary,
+    process: &str,
+    decks: &[&str],
+    suite: Option<&str>,
+    topcell: &str,
+    connectivity: bool,
+    options: &RunOptions,
+) -> Result<Vec<Violation>, String> {
+    run_drc_impl(
+        LibSource::Owned(lib),
+        process,
+        decks,
+        suite,
+        topcell,
+        connectivity,
+        options,
+    )
+}
+
+/// [`run_drc_with`] under the given [`RunOptions`].
+pub fn run_drc_with_options(
+    lib: &GdsLibrary,
+    process: &str,
+    decks: &[&str],
+    suite: Option<&str>,
+    topcell: &str,
+    connectivity: bool,
+    options: &RunOptions,
+) -> Result<Vec<Violation>, String> {
+    run_drc_impl(
+        LibSource::Loaded(lib),
+        process,
+        decks,
+        suite,
+        topcell,
+        connectivity,
+        options,
+    )
+}
+
+fn run_drc_impl(
+    source: LibSource,
+    process: &str,
+    decks: &[&str],
+    suite: Option<&str>,
+    topcell: &str,
+    connectivity: bool,
+    options: &RunOptions,
+) -> Result<Vec<Violation>, String> {
+    if options.tile_um.is_nan() || options.tile_um <= 0.0 {
+        return Err(format!(
+            "tile size must be positive, not {} µm",
+            options.tile_um
+        ));
+    }
+    let mut phase = PhaseTrace::new();
     let pdk = pdk::PdkConfig::for_process(process).map_err(|e| e.to_string())?;
     let rules = if let Some(suite) = suite {
         pdk.load_suite(suite).map_err(|e| e.to_string())?
@@ -99,42 +1161,74 @@ pub fn run_drc(
         }
         rules
     };
+    // The net-aware rules go first, as one pass: the nets - every connect-graph layer
+    // merged and stitched, 4.5 GB on the gf180 reference design - are built before
+    // them and freed after them, instead of staying beside the merge cache for the
+    // whole run.  Nothing reads the order: the summary is by rule id and the
+    // violations are sorted by geometry.
+    let (net_rules, rest): (Vec<_>, Vec<_>) = rules.into_iter().partition(net_aware);
+    let n_net = net_rules.len();
+    let rules: Vec<pdk::RuleDefinition> = net_rules.into_iter().chain(rest).collect();
 
-    // Lazy (tiled) virtual layers: built per tile in the merge cache rather than
-    // materialised in the layout.  A whole-layout check (inside_boundary) therefore
-    // cannot see them, so reject that combination up front rather than report wrong.
-    let tiled_virtuals = pdk.tiled_virtual_layers();
+    // Which virtual layers the layout has to hold as shapes - the ones a whole-layout
+    // check reads - and which the merge cache builds per tile: everything else.  A
+    // layer that has to be materialised and cannot be is refused here, before the
+    // layout is read, rather than read as empty.
+    let eager = pdk.eager_layers(&rules)?;
+    let tiled_virtuals = pdk.tiled_virtual_layers(&eager);
     let lazy_keys: std::collections::HashSet<(i16, i16)> =
         tiled_virtuals.iter().map(|v| v.key).collect();
-    for rule in &rules {
-        if ALL_LAYER_CHECKS.contains(&rule.check.as_str()) {
-            for l in rule.layers.iter().chain(rule.ignore.iter()) {
-                if lazy_keys.contains(&(l.gds_layer as i16, l.gds_datatype as i16)) {
-                    return Err(format!(
-                        "Rule '{}' ({}) references a lazy virtual layer, which is not \
-                         materialised for whole-layout checks; mark it `mode: global`",
-                        rule.id, rule.check
-                    ));
-                }
-            }
-        }
-    }
 
-    let lib = load_gds(gds_path).map_err(|e| e.to_string())?;
-
+    // The rules are validated above before the file is touched, so a bad deck is
+    // reported without a layout - and a missing layout is reported after a good deck.
+    // What the run may take, and a watch on what it takes: over the hard line the
+    // run ends with a message where the kernel would end it without one.
+    let limit = memory::limit(options.memory_limit);
+    let watch = memory::Watch::start(limit.clone());
+    watch.at("loading the layout");
+    let mut owned: Option<GdsLibrary> = None;
+    let lib: &GdsLibrary = match source {
+        LibSource::Loaded(l) => l,
+        LibSource::Owned(l) => owned.insert(l),
+        LibSource::Path(p) => owned.insert(load_gds(p).map_err(|e| e.to_string())?),
+    };
     if !lib.structs.iter().any(|s| s.name == topcell) {
         return Err(format!("Topcell '{topcell}' not found in library"));
     }
+    phase.end("pdk+rules");
 
-    let dbu_to_um = lib.units.1 * 1e6;
+    // A layout drawn in a DBU coarser than a nanometre is read in nanometres.  The
+    // decks' distances sit between two nanometre steps where a bound is strict - Rsil's
+    // heads are opened by 0.1725 so a 0.35 head stays and a 0.345 one goes - and in a
+    // 5 nm DBU no whole number of units falls there: 0.1725 became 0.175 and opened
+    // IHP's own rsil heads away (FMD_QNC_UWB_Pulse_Generator).  Scaled by a whole
+    // factor the geometry is exactly what it was, and every distance means what it
+    // does in the nanometre layouts the decks are written against.
+    let file_dbu_um = lib.units.1 * 1e6;
+    let scale = {
+        let k = (file_dbu_um / NM_DBU_UM).round();
+        if k > 1.0 && (k * NM_DBU_UM - file_dbu_um).abs() < 1e-9 * file_dbu_um {
+            k as i32
+        } else {
+            1
+        }
+    };
+    let dbu_to_um = file_dbu_um / scale as f64;
 
     // Resolve each lazy virtual's op string once (radii converted to DBU); a typo'd
     // op or a missing radius is a config error, not a silently empty layer.
     let tiled_virtuals: Vec<(pdk::TiledVirtualSpec, merge::VirtualOp)> = tiled_virtuals
         .into_iter()
         .map(|spec| {
-            let op = parse_virtual_op(&spec.op, spec.radius, dbu_to_um)
-                .map_err(|e| format!("Lazy virtual layer '{}': {e}", spec.name))?;
+            let op = parse_virtual_op(
+                &spec.op,
+                spec.radius,
+                spec.min,
+                spec.max,
+                spec.slack,
+                dbu_to_um,
+            )
+            .map_err(|e| format!("Lazy virtual layer '{}': {e}", spec.name))?;
             Ok((spec, op))
         })
         .collect::<Result<_, String>>()?;
@@ -142,11 +1236,10 @@ pub fn run_drc(
     // Flatten the cell hierarchy into a FlatLayout indexed by layer/datatype so
     // GdsStructRef/GdsArrayRef instances are visible to every check.  Restrict the
     // flatten to the layers the deck actually touches — a large hierarchy is far
-    // too big to instantiate in full.  `inside_boundary` inspects *every* layer,
-    // so any deck using it must flatten everything.
-    const ALL_LAYER_CHECKS: &[&str] = &["inside_boundary"];
+    // too big to instantiate in full.  A `forbidden` past a boundary inspects *every*
+    // layer, so any deck using it must flatten everything.
     let needed: Option<std::collections::HashSet<(i16, i16)>> =
-        if rules.iter().any(|r| ALL_LAYER_CHECKS.contains(&r.check.as_str())) {
+        if rules.iter().any(checks::residual::whole_layout) {
             None
         } else {
             let mut n: std::collections::HashSet<(i16, i16)> = std::collections::HashSet::new();
@@ -154,14 +1247,18 @@ pub fn run_drc(
                 for l in rule.layers.iter().chain(rule.ignore.iter()) {
                     n.insert((l.gds_layer as i16, l.gds_datatype as i16));
                 }
-                if let Some(&bl) = rule.params.get("boundary_layer") {
-                    let dt = rule.params.get("boundary_datatype").copied().unwrap_or(0.0);
-                    n.insert((bl as i16, dt as i16));
+                // A `layer_params` entry arrives as `<key>` and `<key>_dt`.
+                for (k, l) in &rule.params {
+                    if let (pdk::Param::Num(l), Some(pdk::Param::Num(dt))) =
+                        (l, rule.params.get(&format!("{k}_dt")))
+                    {
+                        n.insert((*l as i16, *dt as i16));
+                    }
                 }
             }
             // Net extraction (if it will run) reads the connect-graph layers, which the
             // rules themselves may not name — pull them in so they are flattened too.
-            if connectivity && rules.iter().any(|r| NET_AWARE_CHECKS.contains(&r.check.as_str())) {
+            if connectivity && rules.iter().any(net_aware) {
                 for spec in &pdk.connectivity {
                     n.insert(spec.connector);
                     n.extend(spec.layers.iter().copied());
@@ -173,8 +1270,23 @@ pub fn run_drc(
             // Iterate to a fixpoint so every layer in the chain is pulled in.
             loop {
                 let mut added = false;
+                for el in &pdk.edge_layers {
+                    let Some(elayer) = pdk.layer(&el.name) else {
+                        continue;
+                    };
+                    if !n.contains(&(elayer.gds_layer as i16, elayer.gds_datatype as i16)) {
+                        continue;
+                    }
+                    for src in &el.layers {
+                        if let Some(s) = pdk.layer(src) {
+                            added |= n.insert((s.gds_layer as i16, s.gds_datatype as i16));
+                        }
+                    }
+                }
                 for vl in &pdk.virtual_layers {
-                    let Some(vlayer) = pdk.layer(&vl.name) else { continue };
+                    let Some(vlayer) = pdk.layer(&vl.name) else {
+                        continue;
+                    };
                     if !n.contains(&(vlayer.gds_layer as i16, vlayer.gds_datatype as i16)) {
                         continue;
                     }
@@ -191,16 +1303,34 @@ pub fn run_drc(
             Some(n)
         };
 
-    let mut layout = flatten::flatten_to_elems(topcell, &lib, needed.as_ref());
-    pdk.compute_virtual_layers(&mut layout, dbu_to_um);
+    watch.at("flattening the layout");
+    let mut layout = flatten::flatten_to_elems(topcell, lib, needed.as_ref(), &pdk.waivers);
+    // Nothing reads the hierarchy past this point.  Handed back to the system only
+    // when it was large: the plan below reads the resident set, and a trim costs a
+    // walk over every arena, which a thousand small runs side by side - the test
+    // suites - pay over and over for nothing.
+    if let Some(lib) = owned.take() {
+        let large = lib.structs.iter().map(|s| s.elems.len()).sum::<usize>() >= 1_000_000;
+        drop(lib);
+        if large {
+            memory::trim();
+        }
+    }
+    layout.scale(scale);
+    phase.end("flatten");
+    if options.stats {
+        print_stats(&pdk, &layout, &rules, &limit);
+        return Ok(vec![]);
+    }
+    pdk.compute_virtual_layers(&mut layout, dbu_to_um, &eager);
+    phase.end("global virtuals");
 
-    // One tiled-merge cache shared by all geometric checks.  The halo must cover
-    // the largest geometric rule distance in the deck so a single cached merge
-    // serves every width/space/notch/etc. rule.
-    const DIST_CHECKS: &[&str] =
-        &["min_width", "max_width", "exact_width", "min_space", "min_notch", "min_enclosure", "max_enclosure"];
-    let tile_dbu = (merge::TILE_UM / dbu_to_um).round() as i32;
+    // One tiled-merge cache shared by all geometric checks.
+    let tile_dbu = ((options.tile_um / dbu_to_um).round() as i32).max(1);
     let halo_dbu = (merge::MIN_HALO_UM / dbu_to_um).ceil() as i32;
+    if options.tile_um != merge::TILE_UM {
+        println!("Tile: {} µm", options.tile_um);
+    }
 
     // Halo is computed per layer: each layer only needs to see neighbour geometry
     // out to the largest distance rule that references *it*.  A deck-wide halo
@@ -218,120 +1348,848 @@ pub fn run_drc(
         let key = (l.gds_layer as i16, l.gds_datatype as i16);
         !lazy_keys.contains(&key) && layout.get(key.0, key.1).is_empty()
     };
-    let mut halo_by_layer: std::collections::HashMap<(i16, i16), i32> = std::collections::HashMap::new();
-    for rule in rules.iter().filter(|r| DIST_CHECKS.contains(&r.check.as_str())) {
-        if matches!(rule.check.as_str(), "min_space" | "min_notch")
-            && rule.layers.iter().any(is_empty_base)
-        {
-            continue;
-        }
-        let h = (merge::MIN_HALO_UM.max(rule.value) / dbu_to_um).ceil() as i32;
-        for l in &rule.layers {
-            let key = (l.gds_layer as i16, l.gds_datatype as i16);
-            let e = halo_by_layer.entry(key).or_insert(0);
-            *e = (*e).max(h);
-        }
+    let edge_specs = pdk.tiled_edge_layers();
+    // What each derived layer is built from, for walking a rule's closure.
+    let mut sources_of: std::collections::HashMap<(i16, i16), Vec<(i16, i16)>> =
+        std::collections::HashMap::new();
+    for (spec, _) in &tiled_virtuals {
+        sources_of.insert(spec.key, spec.sources.clone());
     }
-
-
-    // A lazy virtual layer is composed from its sources' tiles, so each source must
-    // tile with a halo at least as large as the virtual layer's own (the result
-    // keeps only what the sources covered).  A `close` additionally dilates-then-erodes
-    // by its radius, so its source needs an extra 2·radius of halo to be exact in the core;
-    // a `grow` only dilates (no erode-back), so 1·radius suffices.  The radius part is
-    // seeded even when no distance rule references the virtual (e.g. a grow feeding a
-    // `nonempty` chain, like Padc.d's pad-anchored 30 µm reach): a morphological op
-    // intrinsically needs source geometry within its radius to be correct per tile.
-    for (spec, op) in &tiled_virtuals {
-        let extra = match op {
-            merge::VirtualOp::Close(r) | merge::VirtualOp::Open(r) => 2 * r,
-            merge::VirtualOp::Grow(r) => *r,
-            // For `holes`/`with_holes`, radius declares the maximum expected ring
-            // extent: a hole only materialises in a tile whose bucket assembles the
-            // WHOLE ring, so the source needs the full ring within reach.
-            merge::VirtualOp::Holes | merge::VirtualOp::WithHoles => {
-                spec.radius.map(|r| (r / dbu_to_um).ceil() as i32).unwrap_or(0)
-            }
-            _ => 0,
-        };
-        let need = halo_by_layer.get(&spec.key).copied().unwrap_or(0) + extra;
-        if need > 0 {
-            for s in &spec.sources {
-                let e = halo_by_layer.entry(*s).or_insert(0);
-                *e = (*e).max(need);
+    for spec in &edge_specs {
+        sources_of.insert(spec.key, spec.sources.clone());
+    }
+    // The layers a rule reads: the ones it lists, and the ones its layer params name -
+    // a gate, a diode, a reach's confinement, a density's boundary.  Those arrive as
+    // `<key>` and `<key>_dt` numeric params.  Left out, the planner took a diode layer
+    // for unused past its last listed rule, evicted it, and every antenna rule built
+    // the well and the implants over again: 15 s of antenna rules became 42 min on a
+    // 16 GB runner.
+    let rule_keys = |rule: &pdk::RuleDefinition| -> Vec<(i16, i16)> {
+        // An antenna rule reads its regions off the nets, read while they were built,
+        // and nothing of the checks' cache.
+        if connectivity && rule.check == "antenna_ratio" && !pdk.connectivity.is_empty() {
+            return Vec::new();
+        }
+        let mut keys: Vec<(i16, i16)> = rule
+            .layers
+            .iter()
+            .map(|l| (l.gds_layer as i16, l.gds_datatype as i16))
+            .collect();
+        for (k, l) in &rule.params {
+            if let (pdk::Param::Num(l), Some(pdk::Param::Num(dt))) =
+                (l, rule.params.get(&format!("{k}_dt")))
+            {
+                keys.push((*l as i16, *dt as i16));
             }
         }
-    }
+        keys
+    };
+    // The configured maximum per layer: over every rule, for the layers a rule reaches
+    // without naming them and for the diagnostics.
+    let (clippable, whole_chain) = clippable_layers(&tiled_virtuals, &edge_specs, &rules);
+    let all_rules: Vec<&pdk::RuleDefinition> = rules.iter().collect();
+    let (halo_by_layer, halo_why) = halo_table(
+        &all_rules,
+        needed.as_ref(),
+        &clippable,
+        &tiled_virtuals,
+        &edge_specs,
+        &is_empty_base,
+        halo_dbu,
+        tile_dbu,
+        dbu_to_um,
+    );
+    // And per rule, over its own closure, which is what its merges are built at.
+    let rule_halos: Vec<merge::RuleHalos> = rules
+        .iter()
+        .map(|rule| {
+            let closure = layer_closure(rule_keys(rule), &sources_of);
+            let table = halo_table(
+                &[rule],
+                Some(&closure),
+                &clippable,
+                &tiled_virtuals,
+                &edge_specs,
+                &is_empty_base,
+                halo_dbu,
+                tile_dbu,
+                dbu_to_um,
+            )
+            .0;
+            (table, closure)
+        })
+        .collect();
 
+    phase.end("halo tables");
     if std::env::var("GDSCHECK_DUMP_HALO").is_ok() {
         let mut hv: Vec<_> = halo_by_layer.iter().collect();
         hv.sort_by_key(|(_, h)| std::cmp::Reverse(**h));
-        eprintln!("--- per-layer halo (dbu), top 30 ---");
-        for ((l, d), h) in hv.iter().take(30) {
-            eprintln!("  halo {:>9} dbu ({:.1} um)  layer {}/{}", h, **h as f64 * dbu_to_um, l, d);
+        eprintln!("--- per-layer halo (dbu), above the {halo_dbu} dbu minimum ---");
+        for ((l, d), h) in hv.iter().filter(|(_, h)| **h > halo_dbu) {
+            eprintln!(
+                "  halo {:>9} dbu ({:>7.1} um)  layer {:>7}/{:<3}  {}",
+                h,
+                **h as f64 * dbu_to_um,
+                l,
+                d,
+                halo_why
+                    .get(&(*l, *d))
+                    .map(String::as_str)
+                    .unwrap_or("(unattributed)")
+            );
         }
     }
 
-    let mut cache = cache::Cache::new();
+    let virtual_defs = tiled_virtuals.clone();
     let mut merged = merge::MergedCache::new(tile_dbu, halo_dbu, halo_by_layer);
+    merged.set_clippable(clippable.clone());
+    merged.set_whole_chain(whole_chain);
+    merged.set_names(
+        tiled_virtuals
+            .iter()
+            .map(|(spec, _)| (spec.key, spec.name.clone()))
+            .chain(edge_specs.iter().map(|spec| (spec.key, spec.name.clone())))
+            .collect(),
+    );
     for (spec, op) in tiled_virtuals {
         merged.register_virtual(spec.key, op, spec.sources, spec.text);
+    }
+    for spec in pdk.tiled_edge_layers() {
+        let op = parse_edge_op(&spec.op, spec.min, spec.max, spec.fraction, dbu_to_um)
+            .map_err(|e| format!("Edge layer '{}': {e}", spec.name))?;
+        merged.register_edge(spec.key, op, spec.sources);
     }
     let mut violations = vec![];
 
     // A deck may touch dozens of layers; the merged geometry of all of them at
-    // once does not fit in memory.  Record the last rule index that references
-    // each layer, then free that layer's cached tiles/regions once the deck moves
-    // past it.  Decks are grouped by layer, so only a few stay resident at a time.
-    let mut last_use: std::collections::HashMap<(i16, i16), usize> = std::collections::HashMap::new();
+    // once does not fit in memory.  Record the last rule whose closure reaches each
+    // layer - named or built from, down to the drawn layers - then free that layer's
+    // cache once the deck moves past it.  Decks are grouped by layer, so only a few
+    // stay resident at a time.  Going by the layers a rule *names* left every
+    // intermediate of a derivation chain resident for the run: 422 of the 827 virtual
+    // layers GF180's main suite builds are named by no rule, and at 150 bytes a
+    // polygon copy they were half of a peak that reached 100 GB.
+    let mut last_use: std::collections::HashMap<(i16, i16), usize> =
+        std::collections::HashMap::new();
     for (i, rule) in rules.iter().enumerate() {
-        for l in &rule.layers {
-            last_use.insert((l.gds_layer as i16, l.gds_datatype as i16), i);
+        for key in layer_closure(rule_keys(rule), &sources_of) {
+            last_use.insert(key, i);
         }
     }
-
+    // And what every later rule will need of each layer, so a layer cached fatter than
+    // that is dropped as well: rebuilt at the thinner halo on its next use, for the cost
+    // of one merge.  Without this a halo only ever ratchets up - via3 merged at 31 µm
+    // for the slotting opening, 109 million copies, stayed resident through the guard
+    // ring deck that needed it at one, and the run died there.
+    let n_rules = rules.len();
+    // Every reach some rule wants of each layer, for building ahead.
+    let mut needs_of: std::collections::HashMap<(i16, i16), Vec<i32>> =
+        std::collections::HashMap::new();
+    for (table, _) in &rule_halos {
+        for (key, want) in table {
+            needs_of.entry(*key).or_default().push(*want);
+        }
+    }
+    for v in needs_of.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    merged.set_needs(needs_of);
+    let mut future_need: std::collections::HashMap<(i16, i16), Vec<i32>> =
+        last_use.keys().map(|k| (*k, vec![-1; n_rules])).collect();
+    let mut running: std::collections::HashMap<(i16, i16), i32> = std::collections::HashMap::new();
+    // And the next rule that reads each layer after rule `i`, for the cache budget
+    // below: what is evicted first is what is needed last.
+    let mut next_use: std::collections::HashMap<(i16, i16), Vec<usize>> = last_use
+        .keys()
+        .map(|k| (*k, vec![usize::MAX; n_rules]))
+        .collect();
+    let mut coming: std::collections::HashMap<(i16, i16), usize> = std::collections::HashMap::new();
+    for i in (0..n_rules).rev() {
+        for (key, need) in &running {
+            future_need.get_mut(key).expect("key from a closure")[i] = *need;
+        }
+        for (key, at) in &coming {
+            next_use.get_mut(key).expect("key from a closure")[i] = *at;
+        }
+        let (table, closure) = &rule_halos[i];
+        for key in closure {
+            let need = table.get(key).copied().unwrap_or(halo_dbu);
+            let e = running.entry(*key).or_insert(need);
+            *e = (*e).max(need);
+            coming.insert(*key, i);
+        }
+    }
     // Net extraction is lazy: build it once, only if the deck actually has a net-aware
     // check and connectivity is enabled.  A geometry-only deck never pays for it.
-    let net = if connectivity
-        && rules.iter().any(|r| NET_AWARE_CHECKS.contains(&r.check.as_str()))
-        && !pdk.connectivity.is_empty()
-    {
+    let resident_layout = memory::rss_bytes();
+    let mut net = if connectivity && n_net > 0 && !pdk.connectivity.is_empty() {
         use std::io::Write;
+        watch.at("connecting nets");
         print!("Connecting nets ... ");
         std::io::stdout().flush().ok();
         let t = std::time::Instant::now();
-        let c = connectivity::Connectivity::build(&mut merged, &layout, &pdk.connectivity);
+        // Net extraction reads its layers through a cache of its own, tiled with **no
+        // halo**.  A halo exists so a measurement can see across a tile edge; extraction
+        // measures nothing.  It stitches regions, which is decided by core ownership and
+        // by `link_adjacent_pieces` joining the pieces either side of a tile line, and it
+        // resolves points, which are looked up in the tile that contains them - neither
+        // reads a halo copy.  Every layer in the connect graph is a drawn layer or a
+        // boolean of drawn layers, so no morphological op needs one either.
+        //
+        // Sharing the checks' cache made extraction pay the checks' halos, which are set
+        // by the longest rule that touches a layer and by the slotting chain's eight
+        // stacked sizes: 60 µm on Contact and 120 µm on the drawn metals.  Against a
+        // 20 µm tile those multiply a layer's geometry by the square of the ratio -
+        // Contact came to 175 million polygon copies from 3.6 million drawn shapes, and
+        // Metal1 at 120 µm never finished.
+        let mut conn_merged =
+            merge::MergedCache::new(tile_dbu, 0, std::collections::HashMap::new());
+        for (spec, op) in virtual_defs {
+            conn_merged.register_virtual(spec.key, op, spec.sources, spec.text);
+        }
+        // What the antenna rules read region by region with its net - gates, diodes,
+        // antenna layers outside the graph - is read here, a layer at a time.
+        let graph: std::collections::HashSet<(i16, i16)> = pdk
+            .connectivity
+            .iter()
+            .flat_map(|s| std::iter::once(s.connector).chain(s.layers.iter().copied()))
+            .collect();
+        let mut reads: Vec<((i16, i16), (i16, i16))> = rules
+            .iter()
+            .filter(|r| r.check == "antenna_ratio")
+            .flat_map(|r| checks::net::antenna::net_reads(r, |k| graph.contains(&k)))
+            .collect();
+        reads.sort_unstable();
+        reads.dedup();
+        let mut c = connectivity::Connectivity::build(
+            &mut conn_merged,
+            &layout,
+            &pdk.connectivity,
+            dbu_to_um,
+            &reads,
+        );
+        // A conductor keeps what a net is looked up by only where a rule looks one up:
+        // on the layers and layer params of the net-aware rules, the antenna rules
+        // aside, which read their regions with their nodes.  The probe keeps them all.
+        if std::env::var("GDSCHECK_NET_AT").is_err() {
+            let mut keep: std::collections::HashSet<(i16, i16)> = std::collections::HashSet::new();
+            for rule in rules
+                .iter()
+                .filter(|r| net_aware(r) && r.check != "antenna_ratio")
+            {
+                keep.extend(
+                    rule.layers
+                        .iter()
+                        .map(|l| (l.gds_layer as i16, l.gds_datatype as i16)),
+                );
+                for (k, l) in &rule.params {
+                    if let (pdk::Param::Num(l), Some(pdk::Param::Num(dt))) =
+                        (l, rule.params.get(&format!("{k}_dt")))
+                    {
+                        keep.insert((*l as i16, *dt as i16));
+                    }
+                }
+            }
+            c.keep_lookups(&keep);
+        }
+        // Its layers are done with, and the plan below reads the resident set: freed
+        // but kept in glibc's arenas they read as nets.  On FMD_QNC_greyhound_ihp that
+        // was 25 GB of a 64 GB limit, and the checks ran on the rest.
+        drop(conn_merged);
+        memory::trim();
         println!("done ({:.1}s)", t.elapsed().as_secs_f64());
         Some(c)
     } else {
         None
     };
+    // `GDSCHECK_NET_AT="layer:x,y;layer:x,y"` (µm) prints the net each point resolves
+    // to, for finding where a chain the design connects comes apart in the graph.
+    if let (Some(c), Ok(spec)) = (net.as_ref(), std::env::var("GDSCHECK_NET_AT")) {
+        for probe in spec.split(';').filter(|s| !s.trim().is_empty()) {
+            let Some((name, xy)) = probe.split_once(':') else {
+                continue;
+            };
+            let Some((x, y)) = xy.split_once(',') else {
+                continue;
+            };
+            let (Ok(x), Ok(y)) = (x.trim().parse::<f64>(), y.trim().parse::<f64>()) else {
+                continue;
+            };
+            let Some(l) = pdk.layer(name.trim()) else {
+                eprintln!("net probe: no layer '{name}'");
+                continue;
+            };
+            let key = (l.gds_layer as i16, l.gds_datatype as i16);
+            eprintln!(
+                "net probe {name} ({x},{y}) node={:?} net={:?}",
+                c.node_at(key, x / dbu_to_um, y / dbu_to_um),
+                c.net_at(key, x / dbu_to_um, y / dbu_to_um)
+            );
+            // A connector has no index of its own: what each layer it bridges resolves
+            // to at the point is what it would join there.
+            for spec in pdk.connectivity.iter().filter(|s| s.connector == key) {
+                let bridged: Vec<String> = spec
+                    .layers
+                    .iter()
+                    .map(|&lk| {
+                        format!("{:?}:{:?}", lk, c.node_at(lk, x / dbu_to_um, y / dbu_to_um))
+                    })
+                    .collect();
+                eprintln!("  connector bridges {}", bridged.join(" "));
+            }
+        }
+    }
+    phase.end("net extraction");
 
-    for (i, rule) in rules.iter().enumerate() {
-        if NET_AWARE_CHECKS.contains(&rule.check.as_str()) && net.is_none() {
+    // What stays resident is known now - the layout and the nets - and the merge
+    // cache gets what the limit leaves.  Said in one line, so a run that was slower or
+    // died for its memory can be read back to the number it planned with.
+    let resident = memory::rss_bytes();
+    let mut budget = cache_budget_bytes(&limit, resident);
+    merged.set_budget(budget);
+    if resident >= limit.bytes {
+        eprintln!(
+            "Memory: {:.1} GB resident is over the limit of {:.1} GB ({}); the merge cache \
+             is off and every layer is merged again when a rule needs it - expect a slow \
+             run, or a killed one if a rule's own working set does not fit either",
+            memory::gb(resident),
+            memory::gb(limit.bytes),
+            limit.source
+        );
+    } else {
+        println!(
+            "Memory: planning within {:.1} GB ({}), {:.1} GB resident, {:.1} GB for the merge cache",
+            memory::gb(limit.bytes),
+            limit.source,
+            memory::gb(resident),
+            memory::gb(budget as u64)
+        );
+    }
+
+    // From here the cache is shared: the checks read it through the lock, the
+    // bookkeeping between rules takes the lock itself.
+    let shared = merge::SharedCache::new(merged);
+    let trace = std::env::var("GDSCHECK_RULE_TRACE").is_ok();
+    // How many rules may run side by side: `GDSCHECK_WAVE`, four by default, 1 for
+    // one at a time.  Rules of a wave share the cache through its lock and the cores
+    // through rayon, and the wave's memory is admitted against the plan: what each
+    // rule's layers would add, and a reserve for each one's working set.  A rule
+    // alone keeps every core only while it has tiles enough with work in them; the
+    // density rules of a 4 mm² SG13CMOS5L design ran at one to three cores for
+    // twelve of its 65 s, and a wave of four brings the run to 58 s with the same
+    // findings.  Where a rule's time is under the cache's lock - a build - no wave
+    // overlaps it: on the gf180 reference design the waves gain 0.4 s of 72, and the
+    // gain there came from composing the edge layers' tiles in parallel instead.  A
+    // run started on a rayon worker - a test from a parallel iterator - runs its
+    // rules one at a time on that worker whatever is asked: a wave's rules run on
+    // threads of their own and the worker waits for them, and a pool whose every
+    // worker waits so has no one left to run the rules' tile jobs.
+    let wave_max: usize = if rayon::current_thread_index().is_some() {
+        1
+    } else {
+        std::env::var("GDSCHECK_WAVE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(4)
+    };
+    let reserve = limit.bytes / 20;
+
+    let mut i = 0;
+    while i < rules.len() {
+        // The last net-aware rule is done: the nets go, and the cache gets the room.
+        if i == n_net && net.take().is_some() {
+            memory::trim();
+            budget = cache_budget_bytes(&limit, resident_layout);
+            shared.lock().set_budget(budget);
+            if trace {
+                eprintln!(
+                    "nets freed after {n_net} rules, cache budget {:.1} GB",
+                    memory::gb(budget as u64)
+                );
+            }
+        }
+        let rule = &rules[i];
+        if net_aware(rule) && net.is_none() {
             println!(
                 "[{}] Skipping net-aware check '{}' (connectivity disabled)",
                 rule.id, rule.check
             );
+            i += 1;
             continue;
         }
-        violations.append(&mut checks::run_rule(
-            rule,
+        // What this rule needs of every layer in its closure, so a layer is merged at
+        // that rather than at the maximum some other rule on it set.  The cache builds
+        // ahead from `needs_of`, see `MergedCache::build_ahead`.
+        shared.lock().set_rule_halos(Some(rule_halos[i].clone()));
+        // What the rule would hold at once: the layers it still has to build, the ones
+        // it reads that are cached already, and its working set - against the hard
+        // line less what the cache cannot give back.  A rule over that is not run,
+        // since the run would end at the hard line and every rule after it with it,
+        // but recorded, so the report says what it lacks.  Estimated, not measured:
+        // the layers to build from their shapes, the working set at so much per copy.
+        let estimate = rule_estimate_bytes(
+            &rule_halos[i],
             &layout,
-            dbu_to_um,
-            &mut cache,
-            &mut merged,
-            net.as_ref(),
-        ));
-
-        for l in &rule.layers {
-            let key = (l.gds_layer as i16, l.gds_datatype as i16);
-            if last_use.get(&key) == Some(&i) {
-                merged.evict(key.0, key.1);
+            &shared.lock(),
+            &clippable,
+            tile_dbu,
+            halo_dbu,
+        );
+        // A rule's working set while it runs grows with the layers it reads, cached or
+        // still to build: the boxes, the stitches, the pairs.  So much per copy of its
+        // closure, plus the flat reserve, is what a rule is charged - four contact
+        // rules of a 2 million-shape layer were admitted at nothing each into 1.4 GB of
+        // room, and the run ended at the hard line; and a rule about to build forty-six
+        // million contacts, charged for none of them, was let start beside a cache it
+        // had no room left for.
+        let copies: std::collections::HashMap<(i16, i16), usize> = shared.lock().resident_copies();
+        let cached_copies = |k: usize| -> u64 {
+            rule_halos[k]
+                .1
+                .iter()
+                .map(|key| copies.get(key).copied().unwrap_or(0) as u64)
+                .sum()
+        };
+        let to_build = |k: usize| -> u64 {
+            rule_copies_to_build(
+                &rule_halos[k],
+                &layout,
+                &shared.lock(),
+                &clippable,
+                tile_dbu,
+                halo_dbu,
+            )
+        };
+        let working_set = |k: usize| -> u64 {
+            (cached_copies(k) + to_build(k)) * memory::WORKING_SET_PER_COPY + reserve
+        };
+        // What a wave charges a rule: every copy it reads or builds, at four times the
+        // working set they make.  More than the memory, on purpose: charged at what
+        // they take, the contact rules of FMD_QNC_greyhound_ihp - each a build under
+        // the cache's lock - ran four to a wave instead of alone and waited on each
+        // other, the main suite 489 s and 512 s where it was 450 s and 455 s.
+        let wave_charge = |k: usize| -> u64 {
+            (cached_copies(k) + to_build(k)) * memory::WAVE_CHARGE_PER_COPY + reserve
+        };
+        // Read the room off memory in use, not memory the last rule's checks freed
+        // and the allocator kept: near the plan that is gigabytes.
+        if memory::rss_bytes() > limit.bytes / 4 * 3 {
+            memory::trim();
+        }
+        let (cached, closure_cached) = {
+            let cache = shared.lock();
+            let layers = cache.resident_layers();
+            let all: u64 = layers.iter().map(|(_, b)| *b as u64).sum();
+            let own: u64 = layers
+                .iter()
+                .filter(|(k, _)| rule_halos[i].1.contains(k))
+                .map(|(_, b)| *b as u64)
+                .sum();
+            (all, own)
+        };
+        let held = estimate + closure_cached + working_set(i);
+        let room = limit
+            .hard
+            .saturating_sub(memory::rss_bytes().saturating_sub(cached));
+        if held > room {
+            let message = format!(
+                "not checked: it would hold about {:.1} GB of memory at once and \
+                 {:.1} GB were left under the limit of {:.1} GB ({})",
+                memory::gb(held),
+                memory::gb(room),
+                memory::gb(limit.hard),
+                limit.source
+            );
+            eprintln!("[{}] {message}", rule.id);
+            if trace {
+                let (table, closure) = &rule_halos[i];
+                let cache = shared.lock();
+                let mut terms: Vec<(u64, String)> = closure
+                    .iter()
+                    .filter(|k| cache.is_drawn(**k) && !clippable.contains(k))
+                    .map(|k| {
+                        let need = table.get(k).copied().unwrap_or(halo_dbu);
+                        let f = 1.0 + 2.0 * need as f64 / tile_dbu as f64;
+                        let raw = layout.get(k.0, k.1);
+                        let shapes = raw.len();
+                        (
+                            (shapes as f64 * f * f * raw.copy_bytes()) as u64,
+                            format!(
+                                "{} shapes={shapes} halo={need} cached={:?}",
+                                cache.name_of(*k),
+                                cache.cached_halo(*k)
+                            ),
+                        )
+                    })
+                    .collect();
+                terms.sort_by_key(|t| std::cmp::Reverse(t.0));
+                for (b, t) in terms.iter().take(5) {
+                    eprintln!("    estimate {:.1} GB: {t}", memory::gb(*b));
+                }
+            }
+            violations.push(violation::Violation::skipped(
+                &rule.id,
+                &format!("{} not checked", rule.check),
+                message,
+            ));
+            i += 1;
+            continue;
+        }
+        // Room for the rule's layers and its working set: what they would take beyond
+        // what the limit leaves now comes out of the cache first - every layer the rule
+        // does not read goes, latest use first - rather than out of the run.
+        let need = estimate + working_set(i);
+        let room_now = limit.bytes.saturating_sub(memory::rss_bytes());
+        if need > room_now {
+            let (_, closure) = &rule_halos[i];
+            let mut resident = shared.lock().resident_layers();
+            resident.sort_by_key(|(key, _)| {
+                std::cmp::Reverse(next_use.get(key).map_or(usize::MAX, |v| v[i]))
+            });
+            let mut freed = 0usize;
+            for (key, bytes) in resident {
+                if closure.contains(&key) {
+                    continue;
+                }
+                shared.lock().evict(key.0, key.1);
+                freed += bytes;
+                if freed as u64 >= need - room_now {
+                    break;
+                }
+            }
+            if freed > 0 {
+                shared.lock().settle_frees();
+                memory::trim();
+                if trace {
+                    eprintln!(
+                        "room for {}: {:.1} GB needed against {:.1} GB left, {} bytes evicted",
+                        rule.id,
+                        memory::gb(need),
+                        memory::gb(room_now),
+                        freed
+                    );
+                }
             }
         }
-    }
 
+        // The wave: this rule and, after it, the next ones while they are of the same
+        // pass, not among those that run alone, and their layers and working sets fit
+        // beside it under the plan.  The cache is set to the wave's needs at once -
+        // the most any rule of it asks of a layer - so a rule of the wave never finds
+        // a layer built for another one too thin.
+        let mut wave = vec![i];
+        let mut halos = rule_halos[i].clone();
+        let mut named: std::collections::HashSet<(i16, i16)> =
+            rule_keys(rule).into_iter().collect();
+        let mut est_sum = estimate;
+        let mut room_left = limit.bytes.saturating_sub(memory::rss_bytes());
+        room_left = room_left.saturating_sub(wave_charge(i));
+        if !checks::runs_alone(rule) {
+            let mut k = i + 1;
+            while wave.len() < wave_max && k < rules.len() && k != n_net {
+                let next = &rules[k];
+                if checks::runs_alone(next) || (net_aware(next) && net.is_none()) {
+                    break;
+                }
+                let est = rule_estimate_bytes(
+                    &rule_halos[k],
+                    &layout,
+                    &shared.lock(),
+                    &clippable,
+                    tile_dbu,
+                    halo_dbu,
+                );
+                let need = wave_charge(k);
+                if trace {
+                    eprintln!(
+                        "admit {}: est {:.2} GB, working set {:.2} GB, room {:.2} GB{}",
+                        next.id,
+                        memory::gb(est),
+                        memory::gb(wave_charge(k)),
+                        memory::gb(room_left),
+                        if need > room_left { ": no" } else { "" }
+                    );
+                }
+                if need > room_left {
+                    break;
+                }
+                room_left -= need;
+                est_sum += est;
+                for (key, h) in &rule_halos[k].0 {
+                    let e = halos.0.entry(*key).or_insert(*h);
+                    *e = (*e).max(*h);
+                }
+                halos.1.extend(rule_halos[k].1.iter().copied());
+                named.extend(rule_keys(next));
+                wave.push(k);
+                k += 1;
+            }
+        }
+        let last = *wave.last().expect("a wave has its first rule");
+        if wave.len() > 1 {
+            shared.lock().set_rule_halos(Some(halos));
+        }
+        shared.lock().set_rule_named(named);
+        watch.at(format!(
+            "checking {}",
+            wave.iter()
+                .map(|&k| format!("{} ({})", rules[k].id, rules[k].check))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let t_wave = std::time::Instant::now();
+        let c_wave = cpu_seconds();
+        let h_wave = shared.held_seconds();
+        // The rules of a wave run on threads of their own, not on rayon's workers: a
+        // worker that holds the cache's lock and waits on a parallel section steals
+        // other jobs meanwhile - one of another rule, which takes the lock the worker
+        // holds - and the run stops dead.  A plain thread waits without stealing.
+        let results: Vec<Vec<Violation>> = if wave.len() == 1 {
+            vec![checks::run_rule(
+                rule,
+                &layout,
+                dbu_to_um,
+                &shared,
+                net.as_ref(),
+            )]
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|&k| {
+                        let (rules, layout, shared, net) = (&rules, &layout, &shared, net.as_ref());
+                        scope.spawn(move || {
+                            checks::run_rule(&rules[k], layout, dbu_to_um, shared, net)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("a rule's thread panicked"))
+                    .collect()
+            })
+        };
+        let (wall, cpu) = (t_wave.elapsed().as_secs_f64(), cpu_seconds() - c_wave);
+        let held = shared.held_seconds() - h_wave;
+        for (n, found) in wave.iter().zip(results) {
+            violations.extend(found);
+            if trace {
+                let r = &rules[*n];
+                eprintln!(
+                    "rule {} {} {wall:.1}s cpu={cpu:.1}s lock={held:.1}s rss={:.1}GB est={:.1}GB wave={} cache={}",
+                    r.id,
+                    r.check,
+                    rss_gb(),
+                    memory::gb(if *n == i { estimate } else { est_sum }),
+                    wave.len(),
+                    shared.lock().resident_summary()
+                );
+            }
+        }
+
+        let t_plan = std::time::Instant::now();
+        let mut done: Vec<(i16, i16)> = wave
+            .iter()
+            .flat_map(|&k| rule_halos[k].1.iter().copied())
+            .collect();
+        done.sort_unstable();
+        done.dedup();
+        for key in &done {
+            let future = future_need[key][last];
+            // Dropped when nothing later needs it, or when it is far fatter than
+            // anything later needs - the same ratio the rebuild uses, so a copy a
+            // little fatter than the next rule's reach serves it rather than being
+            // merged again at 14% fewer copies.
+            let cached = shared.lock().cached_halo(*key);
+            if future < 0 {
+                if cached.is_some() && trace {
+                    eprintln!(
+                        "evict {} cached={:?} future={future}",
+                        shared.lock().name_of(*key),
+                        cached
+                    );
+                }
+                shared.lock().evict(key.0, key.1);
+            } else if cached.is_some_and(|h| h > future * 4) {
+                if trace {
+                    eprintln!(
+                        "evict {} fatter than {}: cached={:?} future={future}",
+                        shared.lock().name_of(*key),
+                        future * 4,
+                        cached
+                    );
+                }
+                shared.lock().evict_fatter_than(key.0, key.1, future * 4);
+            }
+        }
+        // A budget on what stays resident.  Eviction by need alone keeps every layer
+        // some later rule reads, and on a design whose drawn metals and vias are ten
+        // million shapes each that is a hundred million copies, fifty gigabytes, for
+        // a rule reading one of them.  Over budget, the layers read again latest go
+        // first, and come back for the cost of one merge when their rule arrives.
+        // Over the plan after this wave - the reserve was short of its working set -
+        // the cache gives the overshoot back, evicted just below.
+        // What the wave's checks freed is the next rule's to take; held in the
+        // allocator's arenas it reads as resident and is not always what the next
+        // rule's allocations land in.  Near the plan it goes back to the system: a
+        // contact rule after another on the same layers went over an 8 GB limit on
+        // the 2 GB its predecessor's working set had left behind.
+        if memory::rss_bytes() > limit.bytes / 4 * 3 {
+            let before = memory::rss_bytes();
+            memory::trim();
+            if trace {
+                eprintln!(
+                    "trim after {}: {:.2} GB to {:.2} GB, cache {:.2} GB",
+                    rules[last].id,
+                    memory::gb(before),
+                    memory::gb(memory::rss_bytes()),
+                    memory::gb(shared.lock().resident_bytes() as u64)
+                );
+            }
+        }
+        let rss = memory::rss_bytes();
+        if rss > limit.bytes && shared.lock().resident_bytes() > 0 {
+            let over = (rss - limit.bytes) as usize;
+            budget = budget.saturating_sub(over);
+            shared.lock().set_budget(budget);
+            if trace {
+                eprintln!(
+                    "over the plan by {:.1} GB after {}: cache budget {:.1} GB",
+                    memory::gb(rss - limit.bytes),
+                    rules[last].id,
+                    memory::gb(budget as u64)
+                );
+            }
+        }
+        if shared.lock().resident_bytes() > budget {
+            let mut resident = shared.lock().resident_layers();
+            resident.sort_by_key(|(key, _)| {
+                std::cmp::Reverse(next_use.get(key).map_or(usize::MAX, |v| v[last]))
+            });
+            // The variants set aside go first, then whole layers.
+            for (key, _) in &resident {
+                if shared.lock().resident_bytes() <= budget {
+                    break;
+                }
+                shared.lock().drop_variants(key.0, key.1);
+            }
+            for (key, bytes) in resident {
+                if shared.lock().resident_bytes() <= budget {
+                    break;
+                }
+                if trace {
+                    eprintln!(
+                        "evict {} over budget: {bytes} bytes, next use at rule {:?}",
+                        shared.lock().name_of(key),
+                        next_use.get(&key).map(|v| v[last])
+                    );
+                }
+                shared.lock().evict(key.0, key.1);
+            }
+        }
+        // What was let go is freed aside, unless it is a large part of the budget: then
+        // the memory has to be back before the next rule builds into it, or a run that
+        // fit on a machine of this size before is killed for what it already dropped.
+        if shared.lock().pending_free_bytes() > budget / 4 {
+            shared.lock().settle_frees();
+            memory::trim();
+        }
+        if trace {
+            let plan = t_plan.elapsed().as_secs_f64();
+            if plan >= 0.05 {
+                eprintln!("plan {} {plan:.2}s", rules[last].id);
+            }
+        }
+        i = last + 1;
+    }
+    shared.lock().set_rule_halos(None);
+
+    phase.end("rules");
+    // A run is over the same layout twice, so its report should be the same file twice.
+    // The checks emit while walking tile maps, whose iteration order is not stable, so
+    // the violations arrive shuffled; the *set* is deterministic and the order is not.
+    // Sorting here makes two reports of one layout diffable, which is what anyone
+    // comparing a fix against a baseline needs.
+    // Compared by reference and in parallel: the key used to be built with the rule id
+    // and message cloned for every comparison, and 270 000 violations on
+    // FMD_QNC_greyhound_ihp took half a minute on one core.  The sort is stable, so the
+    // order is what it was.
+    {
+        use rayon::slice::ParallelSliceMut;
+        let corners = |v: &violation::Violation| match v.geometry {
+            violation::ViolationGeometry::Point { x, y } => (x, y, x, y),
+            violation::ViolationGeometry::Edge { x1, y1, x2, y2 } => (x1, y1, x2, y2),
+            violation::ViolationGeometry::None => (0.0, 0.0, 0.0, 0.0),
+        };
+        violations.par_sort_by(|a, b| {
+            a.rule_id
+                .cmp(&b.rule_id)
+                .then_with(|| {
+                    corners(a)
+                        .partial_cmp(&corners(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.message.cmp(&b.message))
+        });
+    }
+    // A violation sitting exactly on a tile line is claimed by both tiles that share it -
+    // see `Core::owns`, which would rather report one twice than let the tile that cannot
+    // see it silence the tile that can.  Sorted, those two are adjacent and identical.
+    violations.dedup_by(|a, b| {
+        a.rule_id == b.rule_id && a.message == b.message && a.geometry == b.geometry
+    });
+    // A marker inside a placed instance of a cell the PDK waives for its rule is kept
+    // and marked, so the report still shows it and the summary counts it apart.  The
+    // instances are filed in a grid of their boxes, and a marker asks the ones in its
+    // cell - the first in the list that holds it and covers its rule, as before: every
+    // marker against every instance was the rest of that half minute.
+    let instances = layout.waived_instances();
+    if !instances.is_empty() {
+        use rayon::prelude::*;
+        const CELL_UM: f64 = 50.0;
+        let cell = (CELL_UM / dbu_to_um).max(1.0);
+        let bin = |v: f64| (v / cell).floor() as i64;
+        let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, inst) in instances.iter().enumerate() {
+            for bx in bin(inst.x0 as f64)..=bin(inst.x1 as f64) {
+                for by in bin(inst.y0 as f64)..=bin(inst.y1 as f64) {
+                    grid.entry((bx, by)).or_default().push(i);
+                }
+            }
+        }
+        violations.par_iter_mut().for_each(|v| {
+            let (x, y) = match v.geometry {
+                violation::ViolationGeometry::Point { x, y } => (x, y),
+                violation::ViolationGeometry::Edge { x1, y1, x2, y2 } => {
+                    ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+                }
+                violation::ViolationGeometry::None => return,
+            };
+            let (px, py) = (x / dbu_to_um, y / dbu_to_um);
+            let Some(candidates) = grid.get(&(bin(px), bin(py))) else {
+                return;
+            };
+            let hit = candidates.iter().map(|&i| &instances[i]).find(|inst| {
+                px >= inst.x0 as f64
+                    && px <= inst.x1 as f64
+                    && py >= inst.y0 as f64
+                    && py <= inst.y1 as f64
+                    && pdk.waivers[inst.waiver].covers_rule(&v.rule_id)
+            });
+            if let Some(inst) = hit {
+                let reason = &pdk.waivers[inst.waiver].reason;
+                v.waived = Some(if reason.is_empty() {
+                    inst.cell.clone()
+                } else {
+                    format!("{}: {reason}", inst.cell)
+                });
+            }
+        });
+    }
+    phase.end("sort+dedup");
     Ok(violations)
 }
 
@@ -339,15 +2197,101 @@ pub fn run_drc(
 mod tests {
     use super::*;
 
-    /// A typo'd op or a missing radius must be a hard error, not a silently empty
+    /// A record whose length field is exactly 4 has an empty payload. gds21 panics on
+    /// that for any string record, so it is rewritten to a two-byte payload — real
+    /// designs do contain empty labels, and one of them should not take a DRC run down.
+    #[test]
+    fn empty_string_records_are_repaired() {
+        // STRNAME "TOP\0" (len 8), an empty STRING (len 4), then ENDEL (len 4).
+        let mut gds = vec![0x00, 0x08, 0x06, 0x06, b'T', b'O', b'P', 0x00];
+        gds.extend_from_slice(&[0x00, 0x04, 0x19, 0x06]);
+        gds.extend_from_slice(&[0x00, 0x04, 0x11, 0x00]);
+        let (out, repaired) = repair_empty_strings(gds);
+        assert_eq!(repaired, 1);
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x08, 0x06, 0x06, b'T', b'O', b'P', 0x00, // STRNAME, untouched
+                0x00, 0x06, 0x19, 0x06, 0x00, 0x00, // STRING, now two bytes long
+                0x00, 0x04, 0x11, 0x00, // ENDEL, untouched
+            ]
+        );
+    }
+
+    /// A non-empty string record, and a non-string record that happens to be 4 bytes
+    /// long, must both come through untouched — ENDEL and friends are always len 4.
+    #[test]
+    fn repair_leaves_everything_else_alone() {
+        let gds = vec![
+            0x00, 0x08, 0x06, 0x06, b'T', b'O', b'P', 0x00, // STRNAME "TOP"
+            0x00, 0x04, 0x11, 0x00, // ENDEL: len 4, but not a string record
+            0x00, 0x04, 0x07, 0x00, // ENDSTR
+        ];
+        let (out, repaired) = repair_empty_strings(gds.clone());
+        assert_eq!(repaired, 0);
+        assert_eq!(out, gds);
+    }
+
+    /// Anything that is not a clean record stream is handed to gds21 untouched, so a
+    /// malformed file still produces gds21's error rather than a mangled one from here.
+    #[test]
+    fn repair_passes_through_a_malformed_stream() {
+        let gds = vec![0x00, 0x02, 0x06, 0x06, 0xff]; // length 2 is impossible
+        let (out, repaired) = repair_empty_strings(gds.clone());
+        assert_eq!(repaired, 0);
+        assert_eq!(out, gds);
+    }
+
+    /// A typo'd op or a missing parameter must be a hard error, not a silently empty
     /// layer (which would turn every rule referencing it into a false-clean).
     #[test]
     fn parse_virtual_op_rejects_bad_config() {
-        assert!(parse_virtual_op("interacting", None, 0.001).is_ok());
-        assert!(parse_virtual_op("grow", Some(0.5), 0.001).is_ok());
-        let e = parse_virtual_op("interactign", None, 0.001).unwrap_err();
+        assert!(parse_virtual_op("interacting", None, None, None, None, 0.001).is_ok());
+        assert!(parse_virtual_op("grow", Some(0.5), None, None, None, 0.001).is_ok());
+        let e = parse_virtual_op("interactign", None, None, None, None, 0.001).unwrap_err();
         assert!(e.contains("unsupported op"), "{e}");
-        let e = parse_virtual_op("close", None, 0.001).unwrap_err();
+        let e = parse_virtual_op("close", None, None, None, None, 0.001).unwrap_err();
         assert!(e.contains("requires a radius"), "{e}");
+        let e = parse_virtual_op("shrink_x", None, None, None, None, 0.001).unwrap_err();
+        assert!(e.contains("requires a radius"), "{e}");
+        // A bbox filter with neither bound would keep everything — almost certainly a
+        // mistyped key rather than an intentional no-op filter.
+        let e = parse_virtual_op("with_bbox_min", None, None, None, None, 0.001).unwrap_err();
+        assert!(e.contains("`min` and/or `max`"), "{e}");
+        // A selector's bounds are neighbour counts, so a fraction is a deck that meant a
+        // measurement, and a zero minimum is a selector that keeps everything.
+        let e = parse_virtual_op("interacting", None, Some(1.5), None, None, 0.001).unwrap_err();
+        assert!(e.contains("whole `min` count"), "{e}");
+        let e = parse_virtual_op("covering", None, Some(0.0), None, None, 0.001).unwrap_err();
+        assert!(e.contains("whole `min` count"), "{e}");
+        assert!(parse_virtual_op("interacting", None, Some(2.0), Some(2.0), None, 0.001).is_ok());
+    }
+
+    /// `overlapping` and `interacting` must resolve to *different* ops: they differ only
+    /// on zero-area contact, and silently aliasing them would be a correctness bug.
+    #[test]
+    fn parse_virtual_op_separates_overlapping_from_interacting() {
+        let over = parse_virtual_op("overlapping", None, None, None, None, 0.001).unwrap();
+        let inter = parse_virtual_op("interacting", None, None, None, None, 0.001).unwrap();
+        assert_ne!(over, inter);
+        // KLayout's `not_outside` / `outside` are the same relation under other names.
+        assert_eq!(
+            over,
+            parse_virtual_op("not_outside", None, None, None, None, 0.001).unwrap()
+        );
+        assert_eq!(
+            parse_virtual_op("not_overlapping", None, None, None, None, 0.001).unwrap(),
+            parse_virtual_op("outside", None, None, None, None, 0.001).unwrap()
+        );
+    }
+
+    /// Bounds are converted from µm to DBU with the library's own scale.
+    #[test]
+    fn parse_virtual_op_converts_bbox_bounds_to_dbu() {
+        let op =
+            parse_virtual_op("with_bbox_min", None, Some(2.0), Some(10.0), None, 0.001).unwrap();
+        assert_eq!(op, merge::VirtualOp::WithBBoxMin(Some(2000), Some(10_000)));
+        let op = parse_virtual_op("with_bbox_max", None, None, Some(0.5), None, 0.001).unwrap();
+        assert_eq!(op, merge::VirtualOp::WithBBoxMax(None, Some(500)));
     }
 }

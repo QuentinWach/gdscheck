@@ -3,13 +3,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use clap::{ArgGroup, Parser, Subcommand};
-use gdscheck::{load_gds, pdk::PdkConfig, report, run_drc};
+use gdscheck::pdk::{self, Origin, PdkConfig};
+use gdscheck::{RunOptions, load_gds, report, run_drc_owned};
 use rayon::ThreadPoolBuilder;
+use std::path::PathBuf;
 
 /// gdscheck — Open Source DRC engine
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// A directory of PDKs, searched before the embedded ones (repeatable)
+    ///
+    /// Holds PDKs as `<dir>/<process>/pdk.yml`.  `GDSCHECK_PDK_PATH` lists more,
+    /// separated like PATH.
+    #[arg(long, global = true, value_name = "DIR")]
+    pdk_path: Vec<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -18,12 +27,52 @@ struct Cli {
 enum Command {
     /// Run DRC on a layout.
     Run(RunArgs),
+    /// List every process: on the PDK path, then embedded.
+    ListProcesses,
     /// List the per-layer decks available in a PDK.
     ListDecks(PdkArgs),
     /// List the curated suites available in a PDK.
     ListSuites(PdkArgs),
     /// Print every rule defined in a deck.
     ShowDeck(ShowDeckArgs),
+    /// Print what a run would take: the shapes per layer and the memory plan
+    ///
+    /// Flattens the layout for a suite or decks and prints the shapes of every layer
+    /// the rules read, largest first, with the memory limit and what is resident once
+    /// the layout is flattened.  Where to start when a run is killed or slow.
+    Stats(StatsArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(group(ArgGroup::new("selection").required(true).multiple(false).args(["deck", "suite"])))]
+struct StatsArgs {
+    /// Input GDS file (plain or gzip-compressed)
+    #[arg(short, long)]
+    input: String,
+
+    /// PDK process name (e.g. ihp-sg13g2) or a path to a pdk.yml
+    #[arg(short, long)]
+    process: String,
+
+    /// Deck(s) whose layers to count, comma-separated; repeatable
+    ///
+    /// Mutually exclusive with --suite.
+    #[arg(short, long, value_delimiter = ',', group = "selection")]
+    deck: Vec<String>,
+
+    /// Suite whose layers to count
+    ///
+    /// Mutually exclusive with --deck.
+    #[arg(short, long, group = "selection")]
+    suite: Option<String>,
+
+    /// Top cell name
+    #[arg(short, long)]
+    topcell: String,
+
+    /// Memory the run would be given, e.g. `12G` (default as for `run`)
+    #[arg(long, env = "GDSCHECK_MEMORY", value_name = "SIZE", value_parser = gdscheck::memory::parse_size)]
+    memory: Option<u64>,
 }
 
 /// Arguments shared by the list-* commands.
@@ -56,12 +105,14 @@ struct RunArgs {
     #[arg(short, long)]
     process: String,
 
-    /// Deck(s) to run, comma-separated (e.g. `metal1,via1`); repeatable.
+    /// Deck(s) to run, comma-separated (e.g. `metal1,via1`); repeatable
+    ///
     /// Mutually exclusive with --suite.
     #[arg(short, long, value_delimiter = ',', group = "selection")]
     deck: Vec<String>,
 
-    /// Suite to run — a curated rule selection (e.g. `main`, `precheck`).
+    /// Suite to run, a curated rule selection (e.g. `main`, `precheck`)
+    ///
     /// Mutually exclusive with --deck.
     #[arg(short, long, group = "selection")]
     suite: Option<String>,
@@ -78,22 +129,64 @@ struct RunArgs {
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
-    /// Disable electrical net extraction.  Net-aware checks (e.g. antenna ratios) are
-    /// then skipped; geometry-only checks are unaffected.
+    /// Tile size of the merge cache in µm
+    ///
+    /// Layers are merged, stitched and measured per tile of this size.  Smaller bounds
+    /// memory tighter, larger copies less into halos.
+    #[arg(long, env = "GDSCHECK_TILE_UM", default_value_t = gdscheck::merge::TILE_UM, value_name = "UM")]
+    tile: f64,
+
+    /// Memory the run may take, e.g. `12G` or `800M`
+    ///
+    /// Without it the run plans within its cgroup's limit (a container, a CI runner)
+    /// or the machine's memory, with a margin; the merge cache is sized to what that
+    /// leaves after the layout and the nets, and a run that would not fit says so
+    /// instead of being killed.
+    #[arg(long, env = "GDSCHECK_MEMORY", value_name = "SIZE", value_parser = gdscheck::memory::parse_size)]
+    memory: Option<u64>,
+
+    /// `gdscheck stats`: flatten, print what the run would take, stop.
+    #[arg(skip)]
+    stats: bool,
+
+    /// Disable net extraction; net-aware checks (antenna ratios) are then skipped
     #[arg(long)]
     no_connectivity: bool,
 
-    /// Print every violation's message, not just the per-rule counts.
+    /// Print every violation's message, not just the per-rule counts
     #[arg(short, long)]
     verbose: bool,
 }
 
 fn main() {
-    match Cli::parse().command {
-        Command::Run(args) => run(args),
-        Command::ListDecks(args) => list(&args.process, ListKind::Decks),
-        Command::ListSuites(args) => list(&args.process, ListKind::Suites),
-        Command::ShowDeck(args) => show_deck(&args.process, &args.deck),
+    // Before any thread exists: glibc opens an arena for a thread the first time it
+    // allocates, and the cap holds only for arenas not yet opened.
+    gdscheck::memory::cap_arenas(std::thread::available_parallelism().map_or(8, |n| n.get()));
+    let cli = Cli::parse();
+    let dirs = cli.pdk_path;
+    match cli.command {
+        Command::Run(args) => run(args, &dirs),
+        Command::Stats(args) => run(
+            RunArgs {
+                input: args.input,
+                process: args.process,
+                deck: args.deck,
+                suite: args.suite,
+                topcell: args.topcell,
+                report: None,
+                threads: 0,
+                tile: gdscheck::merge::TILE_UM,
+                memory: args.memory,
+                stats: true,
+                no_connectivity: true,
+                verbose: false,
+            },
+            &dirs,
+        ),
+        Command::ListProcesses => list_processes(&dirs),
+        Command::ListDecks(args) => list(&args.process, &dirs, ListKind::Decks),
+        Command::ListSuites(args) => list(&args.process, &dirs, ListKind::Suites),
+        Command::ShowDeck(args) => show_deck(&args.process, &dirs, &args.deck),
     }
 }
 
@@ -102,9 +195,18 @@ enum ListKind {
     Suites,
 }
 
-fn load_pdk(process: &str) -> PdkConfig {
-    match PdkConfig::for_process(process) {
-        Ok(p) => p,
+/// The process resolved against `dirs`, and the loaded PDK.  The spec it resolves to is
+/// what the run loads by, so a name found on the PDK path is read from there.
+fn load_pdk(process: &str, dirs: &[PathBuf]) -> (pdk::Resolved, PdkConfig) {
+    let resolved = match pdk::resolve_process(process, dirs) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error loading PDK config: {e}");
+            std::process::exit(1);
+        }
+    };
+    match PdkConfig::for_process(&resolved.spec) {
+        Ok(p) => (resolved, p),
         Err(e) => {
             eprintln!("Error loading PDK config: {e}");
             std::process::exit(1);
@@ -112,8 +214,23 @@ fn load_pdk(process: &str) -> PdkConfig {
     }
 }
 
-fn list(process: &str, kind: ListKind) {
-    let pdk = load_pdk(process);
+fn list_processes(dirs: &[PathBuf]) {
+    let mut seen = std::collections::HashSet::new();
+    for (name, origin) in pdk::list_processes(dirs) {
+        let shadowed = if seen.insert(name.clone()) {
+            ""
+        } else {
+            ", shadowed"
+        };
+        match origin {
+            Origin::Embedded => println!("{name}  (embedded{shadowed})"),
+            Origin::External(p) => println!("{name}  ({}{shadowed})", p.display()),
+        }
+    }
+}
+
+fn list(process: &str, dirs: &[PathBuf], kind: ListKind) {
+    let (_, pdk) = load_pdk(process, dirs);
     let entries = match kind {
         ListKind::Decks => &pdk.decks,
         ListKind::Suites => &pdk.suites,
@@ -128,8 +245,8 @@ fn list(process: &str, kind: ListKind) {
     }
 }
 
-fn show_deck(process: &str, deck: &str) {
-    let pdk = load_pdk(process);
+fn show_deck(process: &str, dirs: &[PathBuf], deck: &str) {
+    let (_, pdk) = load_pdk(process, dirs);
     let rules = match pdk.load_deck(deck) {
         Ok(r) => r,
         Err(e) => {
@@ -150,7 +267,10 @@ fn show_deck(process: &str, deck: &str) {
     // Pre-format every field, then pad each column to its widest entry so values and
     // parameters line up regardless of how long the layer list is.
     let layer_list = |ls: &[gdscheck::pdk::Layer]| {
-        ls.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+        ls.iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let cols: Vec<[String; 6]> = rules
         .iter()
@@ -164,7 +284,7 @@ fn show_deck(process: &str, deck: &str) {
                 String::new()
             } else {
                 // Sort params for stable output (HashMap order is non-deterministic).
-                let mut p: Vec<(&String, &f64)> = r.params.iter().collect();
+                let mut p: Vec<(&String, &gdscheck::pdk::Param)> = r.params.iter().collect();
                 p.sort_by(|a, b| a.0.cmp(b.0));
                 let p: Vec<String> = p.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 format!("{{{}}}", p.join(", "))
@@ -195,27 +315,41 @@ fn show_deck(process: &str, deck: &str) {
     for row in &cols {
         let line = format!(
             "  {:w0$}  {:w1$}  {:w2$}  {:w3$}  {:w4$}  {}",
-            row[0], row[1], row[2], row[3], row[4], row[5],
-            w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3], w4 = w[4],
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            w0 = w[0],
+            w1 = w[1],
+            w2 = w[2],
+            w3 = w[3],
+            w4 = w[4],
         );
         println!("{}", line.trim_end());
     }
 }
 
-fn run(args: RunArgs) {
+fn run(args: RunArgs, dirs: &[PathBuf]) {
     ThreadPoolBuilder::new()
         .num_threads(args.threads) // 0 = rayon default (all logical cores)
         .build_global()
         .expect("Failed to build thread pool");
 
-    let pdk = load_pdk(&args.process);
-    println!("PDK: {} ({})", pdk.name, pdk.version);
+    let (resolved, pdk) = load_pdk(&args.process, dirs);
+    match &resolved.origin {
+        Origin::Embedded => println!("PDK: {} ({})", pdk.name, pdk.version),
+        Origin::External(p) => println!("PDK: {} ({}) from {}", pdk.name, pdk.version, p.display()),
+    }
     if let Some(suite) = &args.suite {
         println!("Suite: {suite}");
     } else {
         println!("Deck: {}", args.deck.join(","));
     }
 
+    let t_load = std::time::Instant::now();
+    let c_load = gdscheck::cpu_seconds();
     let lib = match load_gds(&args.input) {
         Ok(l) => l,
         Err(e) => {
@@ -225,16 +359,32 @@ fn run(args: RunArgs) {
     };
 
     println!("Library: {}", lib.name);
+    if std::env::var("GDSCHECK_RULE_TRACE").is_ok() {
+        let (w, c) = (
+            t_load.elapsed().as_secs_f64(),
+            gdscheck::cpu_seconds() - c_load,
+        );
+        eprintln!(
+            "phase load wall={w:.1}s cpu={c:.1}s cores={:.1}",
+            c / w.max(1e-9)
+        );
+    }
 
     let decks: Vec<&str> = args.deck.iter().map(String::as_str).collect();
     let start = std::time::Instant::now();
-    let violations = match run_drc(
-        &args.input,
-        &args.process,
+    let options = RunOptions {
+        tile_um: args.tile,
+        memory_limit: args.memory,
+        stats: args.stats,
+    };
+    let violations = match run_drc_owned(
+        lib,
+        &resolved.spec,
         &decks,
         args.suite.as_deref(),
         &args.topcell,
         !args.no_connectivity,
+        &options,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -243,32 +393,120 @@ fn run(args: RunArgs) {
         }
     };
     let elapsed = start.elapsed();
+    if args.stats {
+        return;
+    }
 
     println!("Topcell: {}", args.topcell);
     println!("DRC completed in {:.3}s", elapsed.as_secs_f64());
 
+    // A rule the run could not check for its memory is recorded, not a violation:
+    // said apart, under its rule, and the exit status says the report is incomplete.
+    let (skipped, violations): (Vec<_>, Vec<_>) = violations.into_iter().partition(|v| v.skipped);
+    let waived_total = violations.iter().filter(|v| v.waived.is_some()).count();
+    let headline = if waived_total > 0 {
+        format!("{} violation(s), {waived_total} waived:", violations.len())
+    } else {
+        format!("{} violation(s):", violations.len())
+    };
     if violations.is_empty() {
-        println!("DRC clean.");
+        if skipped.is_empty() {
+            println!("DRC clean.");
+        } else {
+            println!("No violations in the rules that were checked.");
+        }
     } else if args.verbose {
-        println!("{} violation(s):", violations.len());
+        println!("{headline}");
         for v in &violations {
-            println!("  [{}] {}", v.rule_id, v.message);
+            match &v.waived {
+                Some(why) => println!("  [{}] {} (waived: {why})", v.rule_id, v.message),
+                None => println!("  [{}] {}", v.rule_id, v.message),
+            }
         }
     } else {
-        println!("{} violation(s):", violations.len());
-        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        println!("{headline}");
+        let mut counts: std::collections::BTreeMap<&str, (usize, usize)> =
+            std::collections::BTreeMap::new();
         for v in &violations {
-            *counts.entry(v.rule_id.as_str()).or_insert(0) += 1;
+            let e = counts.entry(v.rule_id.as_str()).or_insert((0, 0));
+            e.0 += 1;
+            if v.waived.is_some() {
+                e.1 += 1;
+            }
         }
-        for (rule_id, count) in counts {
-            println!("  [{rule_id}] {count}");
+        for (rule_id, (count, waived)) in counts {
+            if waived > 0 {
+                println!("  [{rule_id}] {count} ({waived} waived)");
+            } else {
+                println!("  [{rule_id}] {count}");
+            }
+        }
+    }
+
+    if !skipped.is_empty() {
+        // As the violations: the rule and how many of its checks, the reason only
+        // under --verbose - it was said on stderr when the rule was passed over.
+        println!("{} rule(s) not checked:", skipped.len());
+        if args.verbose {
+            for v in &skipped {
+                println!("  [{}] {}", v.rule_id, v.message);
+            }
+        } else {
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for v in &skipped {
+                *counts.entry(v.rule_id.as_str()).or_insert(0) += 1;
+            }
+            for (rule_id, count) in counts {
+                println!("  [{rule_id}] {count}");
+            }
         }
     }
 
     if let Some(report) = &args.report {
-        match report::write_lyrdb(report, &args.topcell, &violations) {
+        let (t_rep, c_rep) = (std::time::Instant::now(), gdscheck::cpu_seconds());
+        let all: Vec<_> = violations.iter().chain(&skipped).cloned().collect();
+        match report::write_lyrdb(report, &args.topcell, &all) {
             Ok(()) => println!("Report written to: {report}"),
-            Err(e) => eprintln!("Error writing report: {e}"),
+            Err(e) => {
+                eprintln!("Error writing report: {e}");
+                std::process::exit(1);
+            }
+        }
+        if std::env::var("GDSCHECK_RULE_TRACE").is_ok() {
+            let (w, c) = (
+                t_rep.elapsed().as_secs_f64(),
+                gdscheck::cpu_seconds() - c_rep,
+            );
+            eprintln!(
+                "phase report wall={w:.1}s cpu={c:.1}s cores={:.1}",
+                c / w.max(1e-9)
+            );
         }
     }
+
+    // Exit codes: 0 clean, 1 error (bad input, PDK, report), 2 violations found, 3 the
+    // report is incomplete - a rule was not checked for its memory - whatever else it
+    // holds, since a CI that reads 2 as "fix the layout" must not read a missing rule
+    // as one.  A waived violation is reported but does not fail the run: a layout
+    // whose only findings the PDK waives is delivered as clean.  The last line says
+    // the same in words, for whoever reads the terminal and not the exit code.
+    let failing = violations.iter().filter(|v| v.waived.is_none()).count();
+    if !skipped.is_empty() {
+        println!(
+            "Status: INCOMPLETE ({} rule(s) not checked for memory{})",
+            skipped.len(),
+            if failing > 0 {
+                format!(", {failing} violation(s)")
+            } else {
+                String::new()
+            }
+        );
+        std::process::exit(3);
+    }
+    if failing > 0 {
+        println!("Status: FAIL ({failing} violation(s))");
+        std::process::exit(2);
+    }
+    println!("Status: PASS");
 }

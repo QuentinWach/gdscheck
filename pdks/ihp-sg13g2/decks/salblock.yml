@@ -16,14 +16,27 @@ rules:
     layers: [SalBlock]
     value: 0.42
   - id: Sal.c
-    check: min_extension
+    check: min_enclosure
     layers: [SalBlock, ActivOrGatPoly]
     value: 0.20
+    params:
+      metric: euclidian
+      interacting_only: 1
   - id: Sal.d
     check: min_space
     layers: [SalBlock, ActivOrGatPoly]
     value: 0.20
+    params:
+      abutting: report
+  - id: Sal.d
+    check: min_space
+    layers: [SalBlock, ActivOrGatPoly]
+    value: 0.20
+    params:
+      pairs: overlapping
   - id: Sal.e
     check: min_space
     layers: [SalBlock, Cont]
     value: 0.20
+    params:
+      abutting: report

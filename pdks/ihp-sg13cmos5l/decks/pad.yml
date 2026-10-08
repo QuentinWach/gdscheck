@@ -12,12 +12,16 @@ rules:
     layers: [PassivDfpad, SealActiv]
     value: 7.50
   - id: Pad.i
-    check: nonempty
+    check: forbidden
     layers: [DfpadNoTopMetal1]
     value: 0.0
 
   - id: Padb.a
-    check: exact_width
+    check: exact_dim
+    layers: [SBumpPad]
+    value: 60.0
+  - id: Padb.a
+    check: exact_length
     layers: [SBumpPad]
     value: 60.0
   - id: Padb.b
@@ -28,32 +32,44 @@ rules:
     check: min_enclosure
     layers: [TopMetal1, SBumpPad]
     value: 10.0
+    params:
+      metric: euclidian
   - id: Padb.d
     check: min_space
     layers: [SBumpPad, EdgeSeal]
     value: 50.0
   - id: Padb.f
-    check: nonempty
+    check: forbidden
     layers: [SBumpPadBadShape]
     value: 0.0
 
   - id: Padc.a
-    check: exact_width
-    layers: [CuPillarPad]
-    value: 35.0
+    check: forbidden
+    layers: [CuPillarPadOffSize]
+    value: 0.0
   - id: Padc.b
     check: min_space
     layers: [CuPillarPad]
     value: 40.0
+  - id: Padc.b
+    check: min_space
+    layers: [CuPillarPad45]
+    value: 50.0
+  - id: Padc.b
+    check: min_space
+    layers: [CuPillarPad45, CuPillarPadNot45]
+    value: 50.0
   - id: Padc.c
     check: min_enclosure
     layers: [TopMetal1, CuPillarPad]
     value: 7.5
+    params:
+      metric: euclidian
   - id: Padc.d
-    check: nonempty
+    check: forbidden
     layers: [PadcDBad]
     value: 0.0
   - id: Padc.f
-    check: nonempty
+    check: forbidden
     layers: [CuPillarPadBadShape]
     value: 0.0

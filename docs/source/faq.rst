@@ -35,19 +35,19 @@ meaningful sub-DBU grid to check against) — this usually means a stale or wron
 in the deck rather than a real design issue.
 
 
-Lazy virtual layer errors
-----------------------------
+Virtual layer errors
+--------------------
 
-A lazy (``mode: lazy``) virtual layer (:doc:`virtual-ops`) is only resolved when a rule
-actually references it — if you see ``source layer '<name>' not found`` at load time, the
-layer name in a virtual-layer definition's ``layers:`` list doesn't resolve against the
-PDK's layer table (a typo, or a layer defined in a base PDK that an ``extends`` chain
-didn't pick up — remember ``extends`` only inherits ``layers``/``virtual_layers``, not
-``decks``/``suites``/``connectivity``). Check the exact spelling with ``gdscheck
-show-deck`` against the deck that references the virtual layer, and confirm the source
-layer appears in ``gdscheck list-decks``' underlying ``pdk.yml`` layer table.
+A virtual layer (:doc:`virtual-ops`) is a sentence, and the loader reads every sentence
+when the PDK loads: ``virtual layer 'x': unknown layer `q``` names a source that does not
+resolve against the PDK's layer table (a typo, or a layer defined in a base PDK that an
+``extends`` chain didn't pick up — remember ``extends`` only inherits
+``layers``/``virtual_layers``, not ``decks``/``suites``/``connectivity``), and ``column
+N: `and` wants a region on its right`` a word applied to the wrong kind of layer, with the
+column in the sentence. ``must be materialised for rule X`` means a whole-layout check
+names a layer only the tiled cache can build; see *Where a layer is built* on that page.
 
-If a lazy virtual layer instead resolves to an unexpectedly *empty* result, check that
+If a virtual layer instead resolves to an unexpectedly *empty* result, check that
 every source in its derivation chain has its own halo requirement satisfied — a layer
 referenced only by the virtual-layer chain (not directly by any distance-based rule) gets
 the run's baseline halo unless the chain's halo need was propagated to it (see
@@ -65,11 +65,23 @@ grows memory unexpectedly:
   …) references a *dense* layer with an unusually large ``value`` — that inflates the
   layer's halo for every rule sharing it, not just the one that needs it.
 * A check that globally merges a layer rather than using the tiled cache (documented on
-  its own reference page when that's the case, e.g. :doc:`checks/must_interact`) is only
-  safe for genuinely sparse layers (vias, contacts, isolated markers) — if such a check is
-  pointed at a dense, chip-wide layer on a large design, expect it to scale poorly; that's
-  a check-implementation limitation worth reporting, not something to work around by
-  itself.
+  its own reference page when that's the case, e.g. :doc:`checks/ring_covers_boundary`)
+  is only safe for genuinely sparse layers (vias, contacts, isolated markers) — if such a
+  check is pointed at a dense, chip-wide layer on a large design, expect it to scale
+  poorly; that's a check-implementation limitation worth reporting, not something to
+  work around by itself.
+
+A run that ends with ``gdscheck: out of memory while ...`` ran out of the memory it
+may take — the cgroup's limit or the machine's ``MemTotal``, or what ``--memory``
+says (see :doc:`usage`); the ``Memory:`` line in the log is the plan it
+made, and the message says where it was and what helps. A run killed by the kernel
+instead — ``Killed`` in the log, nothing else — is the same thing on a version before
+the watch, or a limit the run could not see. A machine that is short of memory is best
+given a smaller ``--memory`` than a smaller ``--threads``: on the gf180 reference design
+the peak did not move between 32 and 4 threads, while halving the cache took 4 GB off it
+for half again the run time. Swap turns such a run from killed into slow, and is worth
+having on a laptop. A rule the run could not fit is listed as not checked and the run
+exits with ``3``; the report is incomplete and says so, never silently clean.
 
 ``--threads N`` caps the ``rayon`` pool (default: all logical cores) — useful to leave
 headroom on a shared machine, or to get single-threaded, deterministic timing for

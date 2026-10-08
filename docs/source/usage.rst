@@ -56,16 +56,61 @@ extension). Pass exactly one of ``--suite <name>`` (a curated rule selection) or
 ``--deck <name[,name...]>`` (one or more per-layer decks) — the two are mutually
 exclusive.
 
+``--threads`` caps the worker threads (default: every core). ``--tile <µm>``, or
+``GDSCHECK_TILE_UM``, sets the tile the merge cache works in (default 20): every layer is
+merged, stitched and measured per tile of that size with a halo round it. A smaller tile
+bounds memory tighter and cuts the geometry into more pieces, a larger one holds more of
+a dense layer whole and copies less of it into halos. The result must not depend on it;
+a run that differs between two tile sizes is a bug worth reporting.
+
+``GDSCHECK_WAVE=N`` lets up to ``N`` rules run side by side over the shared merge cache,
+within the memory plan; the default is four, ``1`` runs them one at a time (see
+:doc:`architecture`, *Parallelism*). The result does not depend on it.
+
+``--memory <size>``, or ``GDSCHECK_MEMORY``, is what the run may take (``12G``,
+``800M``). Without it the run plans within the tightest cgroup limit above it — a
+container, a ``systemd-run`` scope, a CI runner — or, with none, the machine's
+``MemTotal``. Either way the plan keeps a margin under the amount: a twentieth (at
+least 256 MB) for what a burst of allocation adds between two readings of the resident
+set, and a tenth of the rest for a rule's own working set. The flattened layout and the
+nets stay resident for the whole run; the merge cache is sized to what the plan leaves
+after them, and the run says so in one line (``Memory: planning within 10.3 GB (cgroup
+limit 12.0 GB), 7.1 GB resident, 3.2 GB for the merge cache``). A smaller cache means
+layers are merged again when a later rule needs them: slower, same result. A limit the
+resident part already exceeds turns the cache off and says so on stderr.
+
+The run keeps to its limit as it goes: the net-aware rules run first and the nets are
+freed after them, the cache gives back what a rule overshot the plan by, and a rule
+whose layers would take twice what is left is not checked but recorded — under its
+rule in the summary (``N rule(s) not checked:``) and in the report, tagged ``skipped``
+— with exit status ``3``. A run that outgrows the limit anyway ends with a message
+saying where it was and what helps, where the kernel would have killed it silently.
+The run also caps glibc's malloc arenas at its thread count (``MALLOC_ARENA_MAX`` in the
+environment overrides it): glibc opens up to eight per core and each keeps the slack of
+what was freed in it, a gigabyte on the gf180 reference design on a 32-core machine, at no
+cost in time.
+
+``gdscheck stats`` is where to start on such a run: with the same ``--input``,
+``--process``, ``--topcell`` and ``--suite`` or ``--deck`` it flattens the layout,
+prints the shapes of every layer the rules read, largest first, with the memory limit
+and what is resident then, and stops — the layer a hundred times the size of the others
+is the one a slow or killed run is about.
+
 Other subcommands inspect a PDK without running a check:
 
 .. code-block:: bash
 
+   gdscheck list-processes
    gdscheck list-decks  --process ihp-sg13g2
    gdscheck list-suites --process ihp-sg13g2
    gdscheck show-deck   --process ihp-sg13g2 --deck metal1
+   gdscheck stats       --process ihp-sg13g2 --suite main --topcell TOP --input chip.gds.gz
 
 ``show-deck`` prints every rule in a deck (id, check, layers, value, params) — useful
 for confirming exactly what a suite pulls in before running it on a real layout.
+``stats`` flattens the layout for a suite or decks and prints what a run would take:
+the shapes of every layer the rules read, largest first, and the memory limit with
+what is resident then (see *Memory* below).
 
 
 Decks and suites
@@ -83,10 +128,33 @@ See :doc:`pdk-authoring` for the full deck/suite YAML format.
 Selecting the process
 ----------------------
 
-``--process`` accepts either an embedded PDK name (``ihp-sg13g2``, ``ihp-sg13cmos5l`` —
-built into the binary, no external files needed) or a filesystem path to a ``pdk.yml``
-for an out-of-tree or custom PDK. See :doc:`pdks/index` for the bundled PDKs and
+``--process`` accepts an embedded PDK name (``ihp-sg13g2``, ``ihp-sg13cmos5l`` — built
+into the binary, no external files needed), a filesystem path to a ``pdk.yml``, or the
+name of a PDK on the *PDK path*. See :doc:`pdks/index` for the bundled PDKs and
 :doc:`pdk-authoring` for writing your own.
+
+The PDK path is where PDKs that cannot live in the binary go — a commercial process
+under NDA, a company's own variant of a bundled one. It is a list of directories, each
+holding processes the way the source tree's ``pdks/`` does: ``<dir>/<process>/pdk.yml``
+with the decks beside it. Name directories with ``--pdk-path <dir>`` (before the
+subcommand, repeatable) or in the ``GDSCHECK_PDK_PATH`` environment variable, separated
+like ``PATH``; the option's directories are searched first, then the variable's, then
+the embedded PDKs. A process on the path shadows a bundled one of the same name, and
+``list-processes`` prints every process with where it comes from, marking the shadowed
+ones.
+
+.. code-block:: bash
+
+   export GDSCHECK_PDK_PATH=/opt/pdks/gdscheck
+   gdscheck list-processes
+   gdscheck run --process acme-28 --suite main --topcell TOP --input chip.gds.gz
+
+An external PDK can build on a bundled one: ``extends: ihp-sg13g2`` inherits the base's
+layers, and a deck path such as ``../ihp-sg13g2/decks/activ.yml`` that does not exist
+beside the external ``pdk.yml`` is read from the embedded copy, so the external tree
+carries only what it adds or changes. The ``pdk.yml`` format is not frozen while
+``gdscheck`` is pre-1.0: an external PDK may need touching up after an update, and a
+load error names the file and field.
 
 
 Writing reports
@@ -144,10 +212,22 @@ Command-line reference
      - Optional output ``.lyrdb`` report path.
    * - ``--threads``
      - Worker threads (``0`` = all logical cores, the default).
+   * - ``--memory``
+     - Memory the run may take (``12G``); default: the cgroup's limit or ``MemTotal``.
    * - ``--no-connectivity``
      - Disable net extraction; net-aware checks are skipped.
    * - ``-v, --verbose``
      - Print every violation's message, not just per-rule counts.
+
+Exit status: ``0`` when the layout is clean, ``2`` when violations were found, ``1`` on
+any error (unreadable input, unknown PDK, deck or suite, failed report write), ``3``
+when the report is incomplete: a rule was not checked because the memory it needed was
+not there (see below), whatever else the report holds — a CI that reads ``2`` as "fix
+the layout" must not read a missing rule as one. A violation the PDK waives is reported
+but does not fail the run: a layout whose only findings are waived exits with ``0``. The
+run's last line says the same in words — ``Status: PASS``, ``Status: FAIL (12
+violation(s))``, ``Status: INCOMPLETE (1 rule(s) not checked for memory)`` — for whoever
+reads the terminal and not the exit code.
 
 ``list-decks`` / ``list-suites``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

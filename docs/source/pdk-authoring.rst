@@ -33,9 +33,7 @@ Anatomy of pdk.yml
        description: Metal 2
 
    virtual_layers:
-     - name: Pad
-       op: union
-       layers: [Passiv, Passiv.sbump, Passiv.pillar, dfpad]
+     Pad: Passiv or Passiv.sbump or Passiv.pillar or dfpad
 
    connectivity:
      - connector: Cont
@@ -91,7 +89,7 @@ Each rule needs ``id``, ``check`` (one of the names in :doc:`checks/index`), ``l
 and ``value`` (µm for widths/spaces, µm² for areas, % for densities — see the specific
 check's reference page). ``params`` and ``text`` are optional, check-specific (see
 *Rule parameters* below). ``ignore`` names layers whose shapes a check should skip
-(e.g. excluding the seal ring from an ``inside_boundary`` check).
+(e.g. excluding the passivation ring from a ``forbidden`` past the seal ring).
 
 A rule id may repeat across multiple entries in the same deck (e.g. IHP's ``TM2.b`` is
 both a ``min_space`` and a ``min_notch`` rule) — both fire under the same reported id,
@@ -125,20 +123,23 @@ which live solely in the deck.
 Virtual layers
 --------------
 
-``virtual_layers:`` declares derived layers computed from drawn (or other virtual) ones —
-see :doc:`virtual-ops` for the full operator reference and the eager/lazy evaluation
-trade-off. Each entry needs ``name``, ``op`` and ``layers`` (the sources); ``mode: lazy``,
-``radius`` (for ``close``/``open``/``grow``) and ``text`` (for ``with_text``) are
-optional, op-specific. A virtual layer is assigned a synthetic GDS layer number
-automatically (starting at 30000) and can be referenced by rules exactly like a drawn
-layer.
+``virtual_layers:`` declares derived layers, each a name and the sentence that makes it
+from drawn or other derived layers — ``poly_otp: poly2_drawn and otp_mk``,
+``nat4_gate: poly_nat_lv grow 0.5 inside ngate``, ``channel: SourceDrain edges and
+(GatPoly edges)``. A sentence reads from left to right, parentheses group, values follow
+their word and bounds are ``min``/``max``; see :doc:`virtual-ops` for the words. A region
+and an edge layer are told apart by the words used, so both live in this one block. Every
+derived layer is assigned a synthetic GDS layer number automatically (from 30000, in the
+order declared) and is referenced by rules exactly like a drawn layer. Whether a layer is
+built per tile in the merge cache or materialised in the layout follows from the checks
+that read it, and is not declared.
 
 
 The connectivity graph
 -------------------------
 
 ``connectivity:`` declares how net extraction bridges layers, for the net-aware checks
-(:doc:`checks/antenna_ratio`, :doc:`checks/gate_connected_min_area`) — see
+(:doc:`checks/antenna_ratio`, :doc:`checks/min_area` with ``net: connected``) — see
 :doc:`architecture` for how extraction works. Each entry is a *connector* layer (a via or
 contact) and the conductor layers it joins where it overlaps them:
 
@@ -176,10 +177,11 @@ Deriving a process with extends
      - name: main
        path: suites/main.yml
 
-``extends`` (a path relative to this file) inherits the base PDK's ``layers`` and
-``virtual_layers`` — this file's own entries are appended after them, and a
-``virtual_layers`` entry with the same ``name`` as one in the base *replaces* it (the
-child's definition wins). Everything else — ``decks``, ``suites``, ``connectivity`` — is
+``extends`` (a path relative to this file, or a bare process name for the base beside
+it — ``extends: ihp-sg13g2`` reads as ``../ihp-sg13g2/pdk.yml``) inherits the base PDK's
+``layers`` and ``virtual_layers`` — this file's own entries are appended after them, and a
+``virtual_layers`` entry under the same name as one in the base *replaces* it (the
+child's sentence wins). Everything else — ``decks``, ``suites``, ``connectivity`` — is
 never inherited; a derived process states its own deck list and connect graph explicitly,
 even if it reuses most of the base's rules. One level only: the base file may not itself
 ``extend`` another.
@@ -188,21 +190,38 @@ This is the pattern for a process variant that shares most of a foundry's device
 recognition layers but has its own rule set (a different metal stack, different design
 rules, or — as with SG13CMOS5L — a restricted set of forbidden layers).
 
+The same pattern works outside the source tree. A PDK kept on the PDK path (see
+:doc:`usage`, *Selecting the process*) can extend a bundled base by name, and any file
+it references but does not carry — the base's ``pdk.yml``, a deck such as
+``../ihp-sg13g2/decks/activ.yml`` — is read from the copy embedded in the binary. An
+external directory therefore holds only the ``pdk.yml`` and the decks it adds or
+replaces. The fallback is for files the tree lacks, so a PDK that shadows a bundled
+name cannot at the same time extend the one it shadows: ``../ihp-sg13g2/pdk.yml`` from
+a directory called ``ihp-sg13g2`` is the file itself.
+
 
 Rule parameters
 -----------------
 
-``params:`` is a flat map of ``string -> number`` — every check-specific numeric knob
-beyond the universal ``value`` lives here (e.g. ``window`` for the windowed-density
-checks, ``boundary_layer`` for the seal-ring-aware density checks, ``rows``/``cols`` for
-array-spacing checks). The exact keys a given check reads, with their defaults, are
-listed on that check's reference page under **Parameters** — params the check doesn't
-recognise are silently ignored, so a typo'd param name fails quietly rather than erroring;
-double-check the reference page's exact key spelling.
+``params:`` is a flat map from a name to a number or a word — every check-specific knob
+beyond the universal ``value`` lives here: ``window: 700`` for the windowed-density
+checks, ``rows: 3`` for array spacing, ``sides: adjacent`` or ``metric: square`` for an
+enclosure, ``angle: bent`` for a width. YAML decides which kind a value is (``0.5`` is a
+number, ``bent`` a word), and a check that asked for the other kind says so. Avoid
+YAML's boolean words — ``on``, ``off``, ``yes``, ``no`` — as mode values, or quote them.
+The exact keys a given check reads, with their defaults, are listed on that check's
+reference page under **Parameters** — params the check doesn't recognise are silently
+ignored, so a typo'd param name fails quietly rather than erroring; double-check the
+reference page's exact key spelling.
 
-``text:`` is a separate, sibling field (not inside ``params``, since params only carries
-numbers) for the handful of checks that need a text/label pattern —
-:doc:`checks/forbidden_unless_labeled` is the only current user.
+``layer_params:`` names a *layer* as a parameter, e.g. ``outside: nwell`` for a gate
+length. It is its own block because a layer name and a mode word look alike, and only
+this block is resolved against the PDK's layers; each entry arrives in the check as
+``<name>`` and ``<name>_dt``.
+
+``text:`` is a separate, sibling field for a check that needs a text/label pattern: the
+label that exempts a region from a :doc:`checks/forbidden`, together with a ``label``
+layer param naming the text layer.
 
 
 Validating a new PDK

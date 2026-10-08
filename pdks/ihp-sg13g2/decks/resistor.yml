@@ -11,20 +11,24 @@ rules:
     check: min_space
     layers: [RES, Cont]
     value: 0.12
+    params:
+      abutting: report
   - id: Rsil.c
-    check: nonempty
-    layers: [RsilResProtrusionNoCont]
+    check: forbidden
+    layers: [RsilResInset]
     value: 0.0
   - id: Rsil.d
     check: min_space
     layers: [GPRsilExtended, pSD]
     value: 0.18
+    params:
+      abutting: report
   - id: Rsil.e
     check: min_enclosure
     layers: [EXTBlock, GPRsilExtended]
     value: 0.18
     params:
-      interacting_only: 1
+      metric: euclidian
   - id: Rsil.f
     check: min_width
     layers: [RES]
@@ -36,16 +40,18 @@ rules:
     value: 0.50
   - id: Rppd.b
     check: min_enclosure
-    layers: [pSD, RppdAll]
+    layers: [pSD, GPRppdExtended]
     value: 0.18
     params:
-      interacting_only: 1
+      metric: euclidian
   - id: Rppd.c
     check: min_space
     layers: [RppdCont, SalBlockRppd]
     value: 0.20
+    params:
+      abutting: report
   - id: Rppd.c
-    check: nonempty
+    check: forbidden
     layers: [RppdContTooFar]
     value: 0.0
   - id: Rppd.d
@@ -53,7 +59,7 @@ rules:
     layers: [EXTBlock, GPRppdExtended]
     value: 0.18
     params:
-      interacting_only: 1
+      metric: euclidian
   - id: Rppd.e
     check: min_width
     layers: [SalBlockRppd]
@@ -64,21 +70,27 @@ rules:
     layers: [RhighA]
     value: 0.50
   - id: Rhi.b
-    check: nonempty
+    check: forbidden
     layers: [NsdMismatchAtRhigh]
+    value: 0.0
+  - id: Rhi.b
+    check: forbidden
+    layers: [PsdMismatchAtRhigh]
     value: 0.0
   - id: Rhi.c
     check: min_enclosure
     layers: [pSDnSD, GPRhighExtended]
     value: 0.18
     params:
-      interacting_only: 1
+      metric: euclidian
   - id: Rhi.d
     check: min_space
     layers: [RhighCont, SalBlockRhigh]
     value: 0.20
+    params:
+      abutting: report
   - id: Rhi.d
-    check: nonempty
+    check: forbidden
     layers: [RhighContTooFar]
     value: 0.0
   - id: Rhi.e
@@ -86,7 +98,7 @@ rules:
     layers: [EXTBlock, GPRhighExtended]
     value: 0.18
     params:
-      interacting_only: 1
+      metric: euclidian
   - id: Rhi.f
     check: min_width
     layers: [SalBlockRhigh]

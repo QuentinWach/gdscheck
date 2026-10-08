@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Check-level test PDK.  Where tests/data/synthetic exercises deck and suite
+# *resolution*, this one exercises the checks themselves: two anonymous layers and
+# one rule per thing being measured, so a pattern's expected answer follows from the
+# geometry alone and not from any foundry's reading of it.
+name: Engine
+version: "1.0"
+
+decks:
+  - name: min_enclosure
+    path: decks/min_enclosure.yml
+  - name: array
+    path: decks/array.yml
+  - name: max_space
+    path: decks/max_space.yml
+  - name: density
+    path: decks/density.yml
+  - name: width
+    path: decks/width.yml
+  - name: gate_length
+    path: decks/gate_length.yml
+  - name: space
+    path: decks/space.yml
+  - name: notch
+    path: decks/notch.yml
+  - name: shape
+    path: decks/shape.yml
+  - name: area
+    path: decks/area.yml
+  - name: net
+    path: decks/net.yml
+  - name: residual
+    path: decks/residual.yml
+  - name: overlap
+    path: decks/overlap.yml
+  - name: selection
+    path: decks/selection.yml
+
+# Cells checked as delivered: a violation inside a placed `PADLIB_*` instance is
+# reported waived for ENC.proj, and for nothing else.
+waivers:
+  - cells: ["PADLIB_*"]
+    rules: [ENC.proj]
+    reason: library cell
+
+layers:
+  - name: Outer
+    gds_layer: 1
+    gds_datatype: 0
+  - name: Inner
+    gds_layer: 2
+    gds_datatype: 0
+  - name: Via
+    gds_layer: 3
+    gds_datatype: 0
+  - name: Diode
+    gds_layer: 4
+    gds_datatype: 0
+  - name: Text
+    gds_layer: 5
+    gds_datatype: 0
+
+# Inner less Diode, and what of it lies whole in Outer: a boolean under a selection
+# that an enclosure reads whole.
+virtual_layers:
+  InnerBare: Inner not Diode
+  InnerBareInOuter: InnerBare inside Outer
+  # The edges of Outer, for a reach rule read per edge.
+  Outer.edges: Outer edges
+  # The edges of Inner cut at Outer's boundary: what lies inside Outer and what outside,
+  # an edge on Outer's wall counting as inside on every side.
+  Inner.edges: Inner edges
+  InnerEdgesInOuter: Inner.edges inside_part Outer
+  InnerEdgesOutOuter: Inner.edges outside_part Outer
+
+# Via joins Inner, then Diode, then Outer, for the rules gated on nets and for the
+# antenna rule's levels: through Inner's step alone, Outer is not yet on the net.
+connectivity:
+  - connector: Via
+    layers: [Inner]
+  - connector: Via
+    layers: [Diode]
+  - connector: Via
+    layers: [Outer]

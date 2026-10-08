@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Native Vt device.  12 of the 12 rules in this section.
+#
+rules:
+  - id: NAT.1
+    check: min_enclosure
+    layers: [nat, nat_ncomp]
+    value: 2.0
+    params:
+      interacting_only: 1
+      metric: euclidian
+  - id: NAT.1
+    check: forbidden
+    layers: [nat1_crossing]
+    value: 0.0
+  - id: NAT.2
+    check: min_space
+    layers: [nat, comp_outside_nat]
+    value: 0.3
+    params:
+      abutting: report
+  - id: NAT.3
+    check: min_space
+    layers: [nat, nwell]
+    value: 0.5
+    params:
+      abutting: report
+  - id: NAT.4
+    check: min_gate_length
+    layers: [poly_nat_lv, ngate]
+    value: 1.8
+    layer_params:
+      outside: nwell
+  - id: NAT.5
+    check: min_gate_length
+    layers: [poly_nat_mv, ngate]
+    value: 1.8
+    layer_params:
+      outside: nwell
+  - id: NAT.6
+    check: max_nets_under
+    layers: [nat, nat6_comp]
+    value: 1.0
+    layer_params:
+      net_of: natcomp_con
+  - id: NAT.7
+    check: min_space
+    layers: [nat]
+    value: 0.74
+  - id: NAT.7
+    check: min_notch
+    layers: [nat]
+    value: 0.74
+  - id: NAT.8
+    check: forbidden
+    layers: [nat8_viol]
+    value: 0.0
+  - id: NAT.9
+    check: forbidden
+    layers: [nat9_interconnect]
+    value: 0.0
+  - id: NAT.9
+    check: min_space
+    layers: [nat, poly_off_nat]
+    value: 0.3
+    params:
+      abutting: report
+  - id: NAT.10
+    check: forbidden
+    layers: [nat10_viol]
+    value: 0.0
+  - id: NAT.11
+    check: forbidden
+    layers: [nat11_viol]
+    value: 0.0
+  - id: NAT.12
+    check: forbidden
+    layers: [nat12_viol]
+    value: 0.0

@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# ESD implant.  All 14 rules in this section.
+rules:
+  - id: ESD.1
+    check: min_width
+    layers: [esd]
+    value: 0.6
+  - id: ESD.2
+    check: min_space
+    layers: [esd]
+    value: 0.6
+  - id: ESD.2
+    check: min_notch
+    layers: [esd]
+    value: 0.6
+  # A butted N+ active is nothing away from the implant, which is under the value;
+  # ESD.3b blesses the butted *P+* one, and that is a rule of its own.
+  - id: ESD.3a
+    check: min_space
+    layers: [esd, ncomp]
+    value: 0.6
+    params:
+      abutting: report
+  - id: ESD.3b
+    check: forbidden
+    layers: [esd_on_pcomp]
+    value: 0.0
+  # The margin is the closest approach: a step in the implant's boundary can come under
+  # the value from the active's corner with no two walls facing (report, esd finding 3).
+  - id: ESD.4a
+    check: min_enclosure
+    layers: [esd_edges_no_pcomp, ncomp.edges]
+    value: 0.24
+    params:
+      metric: euclidian
+  - id: ESD.4b
+    check: min_overlap
+    layers: [esd, comp]
+    value: 0.45
+  - id: ESD.5a
+    check: min_area
+    layers: [esd]
+    value: 0.49
+  - id: ESD.5b
+    check: min_area
+    layers: [esd]
+    value: 0.49
+    params:
+      scope: hole
+  - id: ESD.6
+    check: min_enclosure
+    layers: [esd.edges, esd6_poly]
+    value: 0.45
+    params:
+      metric: euclidian
+  - id: ESD.7
+    check: forbidden
+    layers: [esd_on_pcomp]
+    value: 0.0
+  - id: ESD.8
+    check: min_space
+    layers: [esd, nplus_or_pplus]
+    value: 0.3
+  - id: ESD.9
+    check: forbidden
+    layers: [esd_no_dualgate]
+    value: 0.0
+  - id: ESD.10
+    check: forbidden
+    layers: [esd10_viol]
+    value: 0.0
+  - id: ESD.pl
+    check: min_gate_length
+    layers: [poly_esd, tgate]
+    value: 0.8

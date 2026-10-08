@@ -1,0 +1,524 @@
+// SPDX-FileCopyrightText: 2026 aesc silicon
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Via-array spacing: `min_space` with `rows` and `cols`.  A large array must be spaced
+//! more generously than a lone via, and the gate is membership in one.
+//!
+//! Foundries write this rule two ways, and `axes` picks between them.
+//!
+//! * `axes: 1` (default) — the spacing must reach `value` in **at least one** axis; the
+//!   other only needs the ordinary spacing rule.  A violation is an array tight in
+//!   *both* directions.  IHP's `V1.b1` is this.
+//! * `axes: 2` — the spacing must reach `value` in **both** axes, so *any* tight pair
+//!   inside a large enough array is a violation.  GF180's `V#.2b` is this: 0.36 µm
+//!   inside a 4×4-or-larger array against an ordinary 0.26 µm.
+//!
+//! The two are not interchangeable. An array tight in x and relaxed in y is clean under
+//! the first and a violation under the second.
+//!
+//! Detection requires genuine two-dimensional density, mirroring the reference
+//! deck's morphological test (close, then erode by half an array-block extent):
+//! a **run** is a maximal chain of horizontally tight vias (edge gap < `value`,
+//! rows overlapping in y); a run *qualifies* when it is longer than `cols`; and a
+//! violation needs more than `rows` qualifying runs stacked vertically tight
+//! (x-overlapping, vertical edge gap < `value`).  This is exactly "tight in both
+//! directions": a via **ring** (e.g. around a bond pad) has long runs but never
+//! more than two stacked, a single row/column has no stack, and an array that
+//! relaxes either axis to ≥ `value` loses its runs or its stacking — all clean.
+//!
+//! Under `axes: 2` the array has to be recognised *before* its spacing is judged, since
+//! a legal array is one nothing is tight in.  `pitch` is the gap up to which two vias
+//! count as belonging to the same array; it defaults to `value`, and a deck whose array
+//! rule allows spacings above the limit to still form an array sets it higher (GF180
+//! closes the layer by 0.2 µm, which bridges 0.4).  Under `axes: 1` grouping and
+//! violation are the same question, so `pitch` does not apply.
+//!
+//! Params: `rows` and `cols` (array-size thresholds, "more than N"; either one names
+//! the gate, the other defaults to 3), `axes` (1 or 2; default 1), `pitch` (µm; default
+//! `value`), `count` (smallest array in vias; default 0), `min_extent` (µm, the
+//! smallest side of the array's box), `projection` (µm, how far two vias must overlap
+//! across a gap to be neighbours).  Every gap, overlap and extent is read in DBU.
+//! Vias are read as rectangles from the tiled cache, and an array spans tiles freely.
+
+use crate::geom::on_grid;
+use crate::layout::FlatLayout;
+use crate::merge::{SharedCache, UnionFind};
+use crate::pdk::RuleDefinition;
+use crate::violation::Violation;
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+/// A via as its bounding box in DBU.
+struct Via {
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+}
+
+impl Via {
+    fn cx(&self) -> i64 {
+        (self.x0 + self.x1).div_euclid(2)
+    }
+    fn cy(&self) -> i64 {
+        (self.y0 + self.y1).div_euclid(2)
+    }
+}
+
+pub fn run(
+    rule: &RuleDefinition,
+    layout: &FlatLayout,
+    dbu_to_um: f64,
+    merged: &SharedCache,
+) -> Vec<Violation> {
+    let layer = &rule.layers[0];
+    let value_um = rule.value;
+    let dbu = |um: f64| on_grid(um / dbu_to_um, f64::round);
+    let value = dbu(value_um);
+    let rows_thr = rule.num("rows").unwrap_or(3.0) as usize;
+    let cols_thr = rule.num("cols").unwrap_or(3.0) as usize;
+    let axes = rule.num("axes").unwrap_or(1.0) as usize;
+    // Smallest array, in vias, the rule applies to. The row/column thresholds already
+    // bound the shape; this bounds the population, which is how the reference words it
+    // ("interacting with 16 or more vias") and what keeps a ragged cluster that happens
+    // to span four rows from counting as a 4×4 array.
+    let min_count = rule.num("count").unwrap_or(0.0) as usize;
+    let pitch = rule.num("pitch").map(dbu).unwrap_or(value);
+    // Smallest side of the array's bounding box, in µm, for it to count.  GF180 words
+    // "4x4 or larger" as a box at least three vias and three spaces across in every
+    // direction, so a stack four rows deep at a tighter pitch is not yet an array.
+    let min_extent = rule.num("min_extent").map(dbu).unwrap_or(0);
+    // How far two vias must overlap, across the gap, for the gap to be a space between
+    // them at all: KLayout's `projecting >= x`.  Staggered rows overlapping by less are
+    // not neighbours in the array sense; with nothing asked, any overlap at all.
+    let projection = rule.num("projection").map(dbu).unwrap_or(0).max(1);
+    // What counts as "next to" for the purpose of finding the array.  With `axes: 1`
+    // a gap of exactly the value still belongs to the array - the array is the vias
+    // within the value of each other, and the rule is that one of its two directions
+    // is relaxed to the value *throughout*.  An array whose row gaps alternate under
+    // and at the value is tight in both directions and a violation, and linking by the
+    // strict gap broke it into stacks two rows deep that no rule saw.
+    let link = if axes >= 2 {
+        pitch.max(value)
+    } else {
+        value + 1
+    };
+
+    println!(
+        "[{}] Checking min_space >= {:.2} µm in {} of 2 axes, arrays over {}×{}, on layer {}",
+        rule.id, value_um, axes, rows_thr, cols_thr, layer.name
+    );
+
+    // One via per merged piece, read from the tiled cache so that a derived layer - a
+    // via square selected out of the drawn vias - is seen at all; the flat layout holds
+    // drawn shapes only.  Vias are single, non-touching rectangles, so a tile's pieces
+    // are the vias it holds, and each is read as its bounding box in parallel.  A via
+    // in several tiles' halos is the same rectangle in each, and identical rectangles
+    // are de-duplicated by their integer-DBU extent below.  A piece that reaches the
+    // edge of its tile's window is a clip of something larger than the window - a
+    // seal ring drawn on the via layer - and not a via: each tile held a different
+    // fragment of one such ring, and the fragments read as an array.
+    let (gl, gd) = (layer.gds_layer as i16, layer.gds_datatype as i16);
+    merged.ensure(layout, gl, gd);
+    let tile = merged.tile_dbu() as i64;
+    let halo = merged.halo_of(gl, gd) as i64;
+    let gmap = merged.tiles(gl, gd);
+    let pieces: Vec<((i32, i32), &crate::merge::MergedPoly)> = gmap
+        .iter()
+        .flat_map(|(&t, polys)| polys.iter().map(move |m| (t, m)))
+        .collect();
+    let vias: Vec<((i32, i32, i32, i32), Via)> = pieces
+        .par_iter()
+        .filter_map(|&((tx, ty), m)| {
+            if m.outer.len() < 3 {
+                return None;
+            }
+            let (x0, y0, x1, y1) = crate::merge::poly_bbox(m);
+            if x1 <= x0 || y1 <= y0 {
+                return None;
+            }
+            let (wx0, wy0) = (tx as i64 * tile - halo, ty as i64 * tile - halo);
+            let (wx1, wy1) = ((tx as i64 + 1) * tile + halo, (ty as i64 + 1) * tile + halo);
+            if x0 as i64 <= wx0 || y0 as i64 <= wy0 || x1 as i64 >= wx1 || y1 as i64 >= wy1 {
+                return None;
+            }
+            let via = Via {
+                x0: x0 as i64,
+                y0: y0 as i64,
+                x1: x1 as i64,
+                y1: y1 as i64,
+            };
+            Some(((x0, y0, x1, y1), via))
+        })
+        .collect::<Vec<_>>();
+    // Identical rectangles are one via.  Sorted and deduplicated in parallel rather
+    // than hashed one by one: seven million vias are a second and a half of hashing
+    // on one core, and every step of this check used to do it that way.
+    let mut vias = vias;
+    vias.par_sort_unstable_by_key(|(k, _)| *k);
+    vias.dedup_by_key(|(k, _)| *k);
+    let vias: Vec<Via> = vias.into_iter().map(|(_, v)| v).collect();
+
+    let n = vias.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    // Hash grid: a connectible neighbour (edge gap < value, axis-aligned) has its
+    // centroid within `value + via extent` in one axis and overlaps in the other, so
+    // a cell of that size puts every neighbour in the 3×3 block around a via.
+    let max_extent = vias
+        .iter()
+        .fold(0i64, |a, v| a.max(v.x1 - v.x0).max(v.y1 - v.y0));
+    let cell = (link + max_extent).max(1);
+    let cell_of = |v: &Via| (v.cx().div_euclid(cell), v.cy().div_euclid(cell));
+    let grid = Grid::build(
+        (0..n)
+            .into_par_iter()
+            .map(|i| (cell_of(&vias[i]), i))
+            .collect(),
+    );
+
+    // Discover the horizontally tight via pairs in parallel (the grid and via list
+    // are read only here), then replay the unions sequentially — union-find is cheap
+    // and the per-pair geometry is the work worth spreading across cores.
+    let h_edges: Vec<(usize, usize)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let a = &vias[i];
+            let (gx, gy) = cell_of(a);
+            let mut local = Vec::new();
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for &j in grid.get((gx + dx, gy + dy)) {
+                        if j <= i {
+                            continue;
+                        }
+                        let b = &vias[j];
+                        // Same row (y ranges overlap) and a tight horizontal gap.  Two
+                        // vias that overlap are one via - two cells placing the same
+                        // array a little apart - and there is no gap between them to
+                        // measure, only a merge that never happened.
+                        if a.y1.min(b.y1) - a.y0.max(b.y0) > 0 {
+                            let xgap = (b.x0 - a.x1).max(a.x0 - b.x1);
+                            if xgap >= 0 && xgap < link {
+                                local.push((i, j));
+                            }
+                        }
+                    }
+                }
+            }
+            local.into_iter()
+        })
+        .collect();
+
+    let mut uf = UnionFind::new(n);
+    for (i, j) in h_edges {
+        uf.union(i, j);
+    }
+
+    // Horizontal runs, keeping only those longer than the column threshold.
+    // Grouped by root through a sort, like the grid: the roots are read once in order
+    // (path compression wants the borrow), then the vias are sorted by root in parallel
+    // and each run is a range.
+    let roots: Vec<usize> = (0..n).map(|i| uf.find(i)).collect();
+    let mut by_root: Vec<(usize, usize)> = (0..n).into_par_iter().map(|i| (roots[i], i)).collect();
+    by_root.par_sort_unstable();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let root = by_root[at].0;
+        let end = at + by_root[at..].partition_point(|&(r, _)| r == root);
+        runs.push(by_root[at..end].iter().map(|&(_, i)| i).collect());
+        at = end;
+    }
+    struct Run {
+        members: Vec<usize>,
+        x0: i64,
+        y0: i64,
+        x1: i64,
+        y1: i64,
+    }
+    let runs: Vec<Run> = runs
+        .into_par_iter()
+        .filter(|m| m.len() > cols_thr)
+        .map(|members| {
+            let (mut x0, mut y0) = (i64::MAX, i64::MAX);
+            let (mut x1, mut y1) = (i64::MIN, i64::MIN);
+            for &i in &members {
+                x0 = x0.min(vias[i].x0);
+                y0 = y0.min(vias[i].y0);
+                x1 = x1.max(vias[i].x1);
+                y1 = y1.max(vias[i].y1);
+            }
+            Run {
+                members,
+                x0,
+                y0,
+                x1,
+                y1,
+            }
+        })
+        .collect();
+
+    // Stack qualifying runs that face each other: x ranges overlap and the vertical
+    // edge gap is tight.  A stack deeper than the row threshold is the violation.
+    //
+    // Runs are filed in the same kind of grid as the vias, under every cell they span,
+    // so a run meets only the runs filed near it.  Every pair used to be tried: a design
+    // with 7.5 million vias has a few hundred thousand qualifying runs, and that was
+    // sixteen seconds a rule on nothing.
+    let cells = |r: &Run| {
+        let (gx0, gx1) = (r.x0.div_euclid(cell), r.x1.div_euclid(cell));
+        let (gy0, gy1) = (r.y0.div_euclid(cell), r.y1.div_euclid(cell));
+        (gx0, gx1, gy0, gy1)
+    };
+    // Filed the way the vias are, sorted in parallel: a run spans a cell per via, and
+    // hashing the seven million entries of a design's runs one by one was most of
+    // the rule.
+    let rgrid = Grid::build(
+        runs.par_iter()
+            .enumerate()
+            .flat_map_iter(|(i, r)| {
+                let (gx0, gx1, gy0, gy1) = cells(r);
+                (gx0..=gx1).flat_map(move |gx| (gy0..=gy1).map(move |gy| ((gx, gy), i)))
+            })
+            .collect(),
+    );
+    let r_edges: Vec<(usize, usize)> = (0..runs.len())
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let a = &runs[i];
+            let (gx0, gx1, gy0, gy1) = cells(a);
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut local = Vec::new();
+            for gx in gx0 - 1..=gx1 + 1 {
+                for gy in gy0 - 1..=gy1 + 1 {
+                    for &j in rgrid.get((gx, gy)) {
+                        if j <= i || !seen.insert(j) {
+                            continue;
+                        }
+                        let b = &runs[j];
+                        if a.x1.min(b.x1) - a.x0.max(b.x0) <= 0 {
+                            continue; // no horizontal overlap: side-by-side arrays, not a stack
+                        }
+                        let ygap = (b.y0 - a.y1).max(a.y0 - b.y1);
+                        if ygap < link {
+                            local.push((i, j));
+                        }
+                    }
+                }
+            }
+            local.into_iter()
+        })
+        .collect();
+    let mut ruf = UnionFind::new(runs.len());
+    for (i, j) in r_edges {
+        ruf.union(i, j);
+    }
+    let mut stacks: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..runs.len() {
+        stacks.entry(ruf.find(i)).or_default().push(i);
+    }
+
+    // Under `axes: 2` the array is only in breach if something inside it is actually
+    // tight; grouping used the looser `pitch`, so that has to be asked separately.
+    // The first tight pair in the array, as (via, neighbour, across a row), so the
+    // marker can sit on the gap that is short rather than on the array's centroid - a
+    // 68-row stack's centroid lands between vias, on nothing anyone can look at.
+    //
+    // A pair counts only where the array is at least `rows` deep *over the pair*: more
+    // than `rows` of the stack's runs have to span the pair's own x-range.  The blob
+    // the pitch groups can carry more than the array - a 12x3 finger of vias at 0.28
+    // hanging off a legal 4x28 block was reported as the block's, where the finger is
+    // three rows and no part of any 4x4.  The foundry deck answers the same case by
+    // dropping the whole blob when any part of it is thinner than four vias, which
+    // also drops a tight pair in the block's own middle (`tail`); asking per pair keeps
+    // that one and exempts the finger.
+    let covered = |stack: &[usize], sx0: i64, sx1: i64| -> bool {
+        stack
+            .iter()
+            .filter(|&&r| runs[r].x0 <= sx0 && runs[r].x1 >= sx1)
+            .count()
+            > rows_thr
+    };
+    // `along`: a pair across a row (`Some(true)`), down a column (`Some(false)`) or
+    // either (`None`).
+    let tight_pair_in = |stack: &[usize],
+                         members: &[usize],
+                         along: Option<bool>|
+     -> Option<(usize, usize, bool)> {
+        let set: std::collections::HashSet<usize> = members.iter().copied().collect();
+        members.iter().find_map(|&i| {
+            let a = &vias[i];
+            let (gx, gy) = cell_of(a);
+            (-1..=1).find_map(|dx| {
+                (-1..=1).find_map(|dy| {
+                    {
+                        grid.get((gx + dx, gy + dy)).find_map(|&j| {
+                            if j == i || !set.contains(&j) {
+                                return None;
+                            }
+                            let b = &vias[j];
+                            // Neighbours in a row, or in a column, closer than the limit.
+                            let xgap = (b.x0 - a.x1).max(a.x0 - b.x1);
+                            let ygap = (b.y0 - a.y1).max(a.y0 - b.y1);
+                            // Overlapping vias are one via; see the row linking above.
+                            // Neighbours that miss each other's projection are
+                            // still under the limit when their corners are: a row
+                            // staggered by half a pitch lies 0.18 below the row
+                            // above, its vias 0.1803 from theirs corner to corner.
+                            let near_corners =
+                                xgap > 0 && ygap > 0 && xgap * xgap + ygap * ygap < value * value;
+                            let row = along != Some(false)
+                                && xgap >= 0
+                                && xgap < value
+                                && (a.y1.min(b.y1) - a.y0.max(b.y0) >= projection || near_corners);
+                            let col = along != Some(true)
+                                && ygap >= 0
+                                && ygap < value
+                                && (a.x1.min(b.x1) - a.x0.max(b.x0) >= projection || near_corners);
+                            let (sx0, sx1) = if row {
+                                (a.x0.min(b.x0), a.x1.max(b.x1))
+                            } else {
+                                (a.x0.max(b.x0), a.x1.min(b.x1))
+                            };
+                            ((row || col) && covered(stack, sx0, sx1)).then_some((i, j, row))
+                        })
+                    }
+                })
+            })
+        })
+    };
+
+    // The stacks are read side by side: a million contacts are a few hundred thousand
+    // of them, and one core walking them was seven seconds a rule.
+    let stacks: Vec<Vec<usize>> = stacks.into_values().collect();
+    let out: Vec<Violation> = stacks
+        .par_iter()
+        .filter_map(|stack| {
+        if stack.len() <= rows_thr {
+            return None;
+        }
+        let members: Vec<usize> = stack
+            .iter()
+            .flat_map(|&r| runs[r].members.iter().copied())
+            .collect();
+        if members.len() < min_count {
+            return None;
+        }
+        let pair = if axes >= 2 {
+            tight_pair_in(stack, &members, None)
+        } else {
+            // Tight in both directions, or one of them is relaxed throughout and the
+            // array is legal.
+            match (
+                tight_pair_in(stack, &members, Some(true)),
+                tight_pair_in(stack, &members, Some(false)),
+            ) {
+                (Some(_), Some(_)) => None,
+                _ => return None,
+            }
+        };
+        if axes >= 2 && pair.is_none() {
+            return None;
+        }
+        let (mut bx0, mut by0, mut bx1, mut by1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        for &i in &members {
+            bx0 = bx0.min(vias[i].x0);
+            by0 = by0.min(vias[i].y0);
+            bx1 = bx1.max(vias[i].x1);
+            by1 = by1.max(vias[i].y1);
+        }
+        if (bx1 - bx0).min(by1 - by0) < min_extent {
+            return None;
+        }
+        let min_cols = stack
+            .iter()
+            .map(|&r| runs[r].members.len())
+            .min()
+            .unwrap_or(0);
+        let (mut sx, mut sy, mut cnt) = (0i64, 0i64, 0i64);
+        for &r in stack {
+            for &i in &runs[r].members {
+                sx += vias[i].cx();
+                sy += vias[i].cy();
+                cnt += 1;
+            }
+        }
+        let um = |v: i64| v as f64 * dbu_to_um;
+        let (cx, cy) = (um(sx) / cnt as f64, um(sy) / cnt as f64);
+        let what = format!(
+            "{}×{} {} array ({:.2}×{:.2} µm)",
+            stack.len(),
+            min_cols,
+            layer.name,
+            um(bx1 - bx0),
+            um(by1 - by0)
+        );
+        if let Some((i, j, row)) = pair {
+            // The segment across the gap, between the two facing walls.
+            let (a, b) = (&vias[i], &vias[j]);
+            let (x1, y1, x2, y2, gap) = if row {
+                let y = um(a.y0.max(b.y0) + a.y1.min(b.y1)) * 0.5;
+                if a.x1 <= b.x0 {
+                    (um(a.x1), y, um(b.x0), y, um(b.x0 - a.x1))
+                } else {
+                    (um(b.x1), y, um(a.x0), y, um(a.x0 - b.x1))
+                }
+            } else {
+                let x = um(a.x0.max(b.x0) + a.x1.min(b.x1)) * 0.5;
+                if a.y1 <= b.y0 {
+                    (x, um(a.y1), x, um(b.y0), um(b.y0 - a.y1))
+                } else {
+                    (x, um(b.y1), x, um(a.y0), um(a.y0 - b.y1))
+                }
+            };
+            Some(Violation::edge(
+                rule.id.as_str(),
+                "Via array spacing violation",
+                format!(
+                    "{what}: space {gap:.4} µm < {value_um:.2} µm at ({x1:.4}, {y1:.4})-({x2:.4}, {y2:.4}) µm"
+                ),
+                x1,
+                y1,
+                x2,
+                y2,
+            ))
+        } else {
+            Some(Violation::point(
+                rule.id.as_str(),
+                "Via array spacing violation",
+                format!("{what} below {value_um:.2} µm at ({cx:.4}, {cy:.4}) µm"),
+                cx,
+                cy,
+            ))
+        }
+        })
+        .collect();
+    out
+}
+
+/// A hash grid as a sorted index: every (cell, item) pair in cell order, looked up by
+/// binary search.  Built in parallel, which a map of vectors is not, and read from every
+/// thread without sharing anything but a slice.
+struct Grid {
+    entries: Vec<((i64, i64), usize)>,
+}
+
+impl Grid {
+    fn build(mut entries: Vec<((i64, i64), usize)>) -> Self {
+        entries.par_sort_unstable();
+        Self { entries }
+    }
+
+    /// The items filed under `cell`, as indices.
+    fn get(&self, cell: (i64, i64)) -> impl Iterator<Item = &usize> + '_ {
+        let start = self.entries.partition_point(|(k, _)| *k < cell);
+        self.entries[start..]
+            .iter()
+            .take_while(move |(k, _)| *k == cell)
+            .map(|(_, i)| i)
+    }
+}

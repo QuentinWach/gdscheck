@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Deep N-well.  All 4 rules in this section.
+rules:
+  - id: DN.1
+    check: min_width
+    layers: [dnwell]
+    value: 1.7
+  - id: DN.2a
+    check: min_space
+    layers: [dnwell]
+    value: 2.5
+    params:
+      net: same
+  - id: DN.2a
+    check: min_notch
+    layers: [dnwell]
+    value: 2.5
+  - id: DN.2b
+    check: min_space
+    layers: [dnwell]
+    value: 5.42
+    params:
+      net: different
+  - id: DN.3
+    check: forbidden
+    layers: [dn3_viol]
+    value: 0.0
+    description: "DN.3: each DNWELL must be directly surrounded by a PCOMP guard ring"

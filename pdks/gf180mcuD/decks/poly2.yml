@@ -1,0 +1,142 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Gate poly.  All 19 rules in this section.
+rules:
+  - id: PL.1_LV
+    check: min_width
+    layers: [poly2_lv_out_plfuse]
+    value: 0.18
+  - id: PL.1_MV
+    check: min_width
+    layers: [poly2_mv_out_plfuse]
+    value: 0.2
+  - id: PL.1a_LV
+    check: min_width
+    layers: [poly2_lv_in_plfuse]
+    value: 0.18
+  - id: PL.1a_MV
+    check: min_width
+    layers: [poly2_mv_in_plfuse]
+    value: 0.18
+
+  - id: PL.2_LV
+    check: min_gate_length
+    layers: [tgate_pl2_lv, comp]
+    value: 0.28
+    params:
+      walls: unshared
+  - id: PL.2_MV
+    check: min_gate_length
+    layers: [ngate_5v, comp]
+    value: 0.6
+    params:
+      walls: unshared
+  - id: PL.2_MV
+    check: min_gate_length
+    layers: [pgate_5v, comp]
+    value: 0.5
+    params:
+      walls: unshared
+  - id: PL.2_MV
+    check: min_gate_length
+    layers: [ngate_6v, comp]
+    value: 0.7
+    params:
+      walls: unshared
+  - id: PL.2_MV
+    check: min_gate_length
+    layers: [pgate_6v, comp]
+    value: 0.55
+    params:
+      walls: unshared
+
+  - id: PL.3a
+    check: min_space
+    layers: [pl3a_poly]
+    value: 0.24
+  - id: PL.3a
+    check: min_notch
+    layers: [pl3a_poly]
+    value: 0.24
+
+  - id: PL.4_LV
+    check: min_enclosure
+    layers: [poly_pl_lv, comp_pl]
+    value: 0.22
+    params:
+      interacting_only: 1
+  - id: PL.4_MV
+    check: min_enclosure
+    layers: [poly_pl_mv, comp_pl]
+    value: 0.22
+    params:
+      interacting_only: 1
+
+  # PL.5a and PL.5b carry the same value and the same layers here; `pairs: any` lets
+  # both read the gap to the gate's own active as well as to any other.
+  - id: PL.5a_LV
+    check: min_space
+    layers: [poly_pl_lv, comp_pl]
+    value: 0.1
+    params:
+      pairs: any
+  - id: PL.5a_MV
+    check: min_space
+    layers: [poly_pl_mv_no_sram, comp_pl]
+    value: 0.3
+    params:
+      pairs: any
+  # "Space from field Poly2 to related COMP": the related active is the gate's own, so
+  # the two shapes overlap where the gate crosses and the gap meant is elsewhere along
+  # them - `pairs: any` reads both that gap and the space to any other active.
+  - id: PL.5b_LV
+    check: min_space
+    layers: [poly_pl_lv, comp_pl]
+    value: 0.1
+    params:
+      pairs: any
+  - id: PL.5b_MV
+    check: min_space
+    layers: [poly_pl_mv_no_sram, comp_pl]
+    value: 0.3
+    params:
+      pairs: any
+
+  - id: PL.6
+    check: no_corner
+    layers: [poly2_drawn, comp_no_ymtp]
+    value: 90.0
+    layer_params:
+      outside: ymtp_mk
+
+  - id: PL.7_LV
+    check: min_gate_length
+    layers: [nom_gate, comp]
+    value: 0.3
+    params:
+      walls: unshared
+      angle: bent
+  - id: PL.7_MV
+    check: min_gate_length
+    layers: [thick_gate, comp]
+    value: 0.7
+    params:
+      walls: unshared
+      angle: bent
+
+  - id: PL.9
+    check: forbidden
+    layers: [pl9_viol]
+    value: 0.0
+
+  - id: PL.11
+    check: forbidden
+    layers: [pl11_viol]
+    value: 0.0
+
+  - id: PL.12
+    check: forbidden
+    layers: [pl12_viol]
+    value: 0.0

@@ -11,57 +11,81 @@ rules:
     check: min_space
     layers: [NWell]
     value: 0.62
+  - id: NW.b
+    check: min_notch
+    layers: [NWell]
+    value: 0.62
   - id: NW.b1
-    check: min_space_different_net
-    layers: [NWellMergedNoSRAM]
+    check: min_space
+    layers: [NWell]
     value: 1.80
+    params:
+      net: different
+    layer_params:
+      gap_outside: NWellOrPWellBlkOrSRAM
   - id: NW.c
     check: min_enclosure
-    layers: [NWell, PsdActivInNWellNoTGONoSRAM]
+    layers: [NWell, PsdActivInNWellNoTGONoSRAMVaricap]
     value: 0.31
+    params:
+      metric: euclidian
   - id: NW.c1
     check: min_enclosure
-    layers: [NWell, PsdActivInNWellTGOAna]
+    layers: [NWell, PsdActivInNWellTGOAnaNoDevice]
     value: 0.62
+    params:
+      metric: euclidian
   - id: NW.c1.dig
     check: min_enclosure
-    layers: [NWell, PsdActivInNWellTGODig]
+    layers: [NWell, PsdActivInNWellTGODigNoVaricap]
     value: 0.31
+    params:
+      metric: euclidian
   - id: NW.d
     check: min_space
-    layers: [NWellNoSRAM, NActFullNoTGO]
+    layers: [NWellNoSRAM, NActExtNoTGO]
     value: 0.31
+    params:
+      abutting: report
   - id: NW.d1
     check: min_space
-    layers: [NWellNoSRAM, NActFullTGOAna]
+    layers: [NWellNoSRAM, NActExtTGOAna]
     value: 0.62
+    params:
+      abutting: report
   - id: NW.d1.dig
     check: min_space
-    layers: [NWellNoSRAM, NActFullTGODig]
+    layers: [NWellNoSRAM, NActExtTGODig]
     value: 0.31
+    params:
+      abutting: report
   - id: NW.e
     check: min_enclosure
-    layers: [NWell, NActivInNWellNoTGO]
+    layers: [NWell, NWellTieNoTGO]
     value: 0.24
     params:
-      skip_clipped: 1
+      metric: euclidian
   - id: NW.e1
     check: min_enclosure
-    layers: [NWell, NActivInNWellTGOAna]
+    layers: [NWell, NWellTieTGOAnaNoDevice]
     value: 0.62
     params:
-      skip_clipped: 1
+      metric: euclidian
   - id: NW.e1.dig
     check: min_enclosure
-    layers: [NWell, NActivInNWellTGODig]
+    layers: [NWell, NWellTieTGODig]
     value: 0.24
     params:
-      skip_clipped: 1
+      metric: euclidian
   - id: NW.f
     check: min_space
-    layers: [NWell, PsdActivInPWellNoTGO]
+    layers: [NWellNoVaricap, SubstrateTieNoTGO]
     value: 0.24
   - id: NW.f1
     check: min_space
-    layers: [NWell, PsdActivInPWellTGO]
+    layers: [NWellNoVaricap, SubstrateTieTGOAna]
     value: 0.62
+  - id: NW.f1.dig
+    check: min_space
+    layers: [NWellNoVaricap, SubstrateTieTGODig]
+    value: 0.24

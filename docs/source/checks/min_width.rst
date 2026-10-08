@@ -24,7 +24,19 @@ Runs the shared facing-edge width scan (:doc:`shared with max_width and exact_wi
 - **Oblique pass**: pairs of mutually anti-parallel diagonal edges (same absolute angle,
   opposite direction) are measured directly, so a 45° trace's width is caught too — this
   pass always runs, even for a plain ``min_width`` rule; it isn't gated on a "bent length"
-  the way :doc:`min_45_width` is.
+  the way ``angle: bent`` is. Anti-parallel is read as far as the grid can say: a
+  boolean cuts a 45° wall and rounds its new end to the DBU, so the two sides of one bar
+  can come out 0.05° apart, and a pair whose gap drifts by under a DBU and a half over
+  the run it shares still bounds a width.
+- **Mixed pass**: a diagonal edge facing an axis-aligned one — the chamfered corner of a
+  well against the straight wall opposite — is measured at its closest approach.
+- **Corner pass**: two facing walls whose projections do not overlap — the steps of a
+  jog, the two stubs either side of a chamfer — are measured from the near end of one to
+  the near end of the other, as KLayout's euclidian metric reads them.
+- **Pinches and acute corners**: a vertex the layer touches itself at (two pieces corner
+  to corner, a notch tip on a straight wall, a contour through one point twice) is a
+  width of zero, reported as a point; so is a corner with less than a right angle of
+  material in it, since the wedge narrows to nothing at the tip.
 
 A width is only reported once its projected overlap between the two walls is real (not
 just touching at a point), and only from the tile whose core contains the gap's midpoint,
@@ -34,11 +46,11 @@ This scan measures **facing walls of one region**, unlike :doc:`min_dim`, which 
 a whole region's bounding box — a min_width rule catches a narrow neck anywhere in an
 irregular shape; min_dim only catches the shape's bounding box being too narrow overall.
 
-It does *not* pair a rectilinear wall against an oblique one (a diagonal stroke closing in
-on a straight stem) — only rectilinear-vs-rectilinear and oblique-vs-oblique pairs are
-currently measured for width. :doc:`min_notch` had the same limitation for its dual
-(the empty-space case) until it was closed by adding a mixed rectilinear/oblique pass;
-the width side of that gap is still open.
+The comparison is exact. The rule's µm value is put on the grid once — rounded up for a
+minimum, down for a maximum, to nearest for an exact width — and after that an
+axis-aligned span is compared as the integer it is, an oblique one squared as a ratio of
+integers. A 45° bar drawn 226 DBU apart in y is 159.81 DBU wide, and a 160 rule reports
+it.
 
 
 Layers
@@ -50,14 +62,33 @@ A single layer, ``layers[0]``.
 Parameters
 ----------
 
-None — only ``value`` (µm).
+``angle``
+   ``bent`` measures only the 45° runs. A fab may ask more width of a diagonal than of a
+   straight trace, since the grid resolves a diagonal as a staircase; that rule sits beside
+   the plain one with its own value.
+
+``length``
+   The run (µm) two facing axis-aligned walls must share — the projection of one onto
+   the other, over the whole walls — before their width counts, KLayout's
+   ``projection_limits``: a rule that binds only lines longer than so much. On a 45°
+   pair, with ``angle: bent``, it is each wall's own length instead - "a bend longer
+   than 0.39" is the bend's wall, and IHP's deck takes the 45° edges of at least that
+   length and measures between them; a band drawn with square ends has its walls offset
+   along their run by its width, so the shared stretch understates the bend. With a
+   length required, the readings that have none (across a corner, at a pinch or acute
+   tip, between a chamfer and a wall) are off. Optional, defaults to ``0``.
 
 
 Violation markers
 ------------------
 
 One edge marker for **each of the two facing walls** of any width below ``value`` (so two
-markers per violation location, one on each wall), at the actual wall geometry.
+markers per violation location, one on each wall), at the actual wall geometry. A pair
+of walls is one violation along the whole stretch they face each other, however many
+other corners of the shape fall alongside it, and whatever the tiling: the pair is
+reported by the tile holding the lowest (then leftmost) end of the stretch, a vertex
+every tile's copy of the shape has where it has it at all, where the stretch's far end
+depends on which drawn shapes reach the tile's zone.
 
 
 KLayout equivalent
@@ -76,3 +107,10 @@ Example
       check: min_width
       layers: [TopMetal2]
       value: 2.00
+    - id: M2.g
+      check: min_width
+      layers: [Metal2]
+      value: 0.24
+      params:
+        angle: bent
+        length: 0.50

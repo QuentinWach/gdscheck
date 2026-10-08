@@ -2,112 +2,241 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-pub mod area;
-pub mod density;
-pub mod helper;
-pub mod coverage;
-pub mod extent;
-pub mod forbidden_overlap;
-pub mod min_array_space;
-pub mod exact_width;
-pub mod inside_boundary;
-pub mod no_angle;
-pub mod gate_length;
-pub mod min_region_density;
-pub mod wide_uncovered;
-pub mod no_ring;
-pub mod ring_covers_boundary;
-pub mod forbidden;
-pub mod max_total_area;
-pub mod antenna_ratio;
-pub mod forbidden_unless_labeled;
-pub mod gate_connected_min_area;
-pub mod must_interact;
-pub mod nonempty;
-pub mod min_enclosed_area;
-pub mod windowed_density;
-pub mod max_width;
-pub mod min_45_width;
-pub mod min_enclosure;
-pub mod max_enclosure;
-pub mod min_endcap_enclosure;
-pub mod min_extension;
-pub mod min_notch;
-pub mod min_space;
-pub mod min_space_different_net;
-pub mod max_space;
-pub mod min_space_bent;
-pub mod min_space_prl;
-pub mod min_width;
-pub mod offgrid;
+//! The checks, one module per family of measurement.  A rule names its check and the
+//! family reads the bound, the scope and the gates from its params; `run_rule` is the
+//! table from check name to family.  In the order a rule deck tends to be read:
+//!
+//! - [`width`]: the material between two walls of one region.
+//! - [`space`]: the gap between two regions, or between two walls of one (a notch), and
+//!   the reach nothing may lie beyond.
+//! - [`enclosure`]: the margin of one region inside another.
+//! - [`shape`]: a region's own extents, edges, corners, holes, vertices and grid.
+//! - [`area`]: a region's area.
+//! - [`count`]: how many regions of a layer the chip holds.
+//! - [`density`]: the coverage of layers over an area.
+//! - [`net`]: what only the connect graph can answer.
+//! - [`residual`]: what a rule forbids outright.
+//!
+//! [`edge_distance`] is the spacing and enclosure read between *edge* layers, which
+//! `space` and `enclosure` hand a rule to when its layers are edges; [`helper`] holds
+//! the tile drivers the families share and [`params`] the readers of a rule's params.
 
-use crate::cache::Cache;
+pub mod area;
+pub mod count;
+pub mod density;
+pub mod edge_distance;
+pub mod enclosure;
+pub mod helper;
+pub mod net;
+pub mod params;
+pub mod residual;
+pub mod shape;
+pub mod space;
+pub mod width;
+
 use crate::layout::FlatLayout;
-use crate::merge::MergedCache;
+use crate::merge::SharedCache;
 use crate::pdk::{Layer, RuleDefinition};
 use crate::violation::Violation;
-use gds21::GdsBoundary;
 
-/// Returns a slice of all boundaries on the given layer.
-pub fn boundaries_on<'a>(layout: &'a FlatLayout, layer: &Layer) -> &'a [GdsBoundary] {
+/// Whether a rule reads its layers from the flat layout rather than the tiled cache,
+/// and so sees a virtual layer only if it was materialised there first: the ring and
+/// vertex readings of a shape, and a `forbidden` past a boundary.
+pub fn reads_layout(rule: &RuleDefinition) -> bool {
+    matches!(
+        rule.check.as_str(),
+        "no_ring" | "ring_covers_boundary" | "max_vertices"
+    ) || residual::whole_layout(rule)
+}
+
+/// All shapes on the given layer.
+pub fn boundaries_on<'a>(layout: &'a FlatLayout, layer: &Layer) -> &'a crate::layout::Shapes {
     layout.get(layer.gds_layer as i16, layer.gds_datatype as i16)
+}
+
+/// Whether a rule has to run with no other beside it: the residual family registers
+/// virtual layers of its own in the cache as it goes, under keys another such rule
+/// could register differently.
+pub fn runs_alone(rule: &RuleDefinition) -> bool {
+    rule.check == "forbidden"
 }
 
 pub fn run_rule(
     rule: &RuleDefinition,
     layout: &FlatLayout,
     dbu_to_um: f64,
-    cache: &mut Cache,
-    merged: &mut MergedCache,
+    merged: &SharedCache,
     conn: Option<&crate::connectivity::Connectivity>,
 ) -> Vec<Violation> {
-    match rule.check.as_str() {
-        "antenna_ratio"         => antenna_ratio::run(rule, layout, dbu_to_um, merged, conn),
-        "gate_connected_min_area" => gate_connected_min_area::run(rule, layout, dbu_to_um, merged, conn),
-        "forbidden_unless_labeled" => forbidden_unless_labeled::run(rule, layout, dbu_to_um, merged),
-        "exact_width"           => exact_width::run(rule, layout, dbu_to_um, merged),
-        "forbidden"             => forbidden::run(rule, layout, dbu_to_um),
-        "forbidden_overlap"     => forbidden_overlap::run(rule, layout, dbu_to_um, merged),
-        "coverage"              => coverage::run(rule, layout, dbu_to_um, merged),
-        "min_dim"               => extent::run_min_width(rule, layout, dbu_to_um, merged),
-        "max_dim"               => extent::run_max_width(rule, layout, dbu_to_um, merged),
-        "min_length"            => extent::run_min_length(rule, layout, dbu_to_um, merged),
-        "max_length"            => extent::run_max_length(rule, layout, dbu_to_um, merged),
-        "inside_boundary"       => inside_boundary::run(rule, layout, dbu_to_um),
-        "ring_covers_boundary"  => ring_covers_boundary::run(rule, layout, dbu_to_um),
-        "min_density"           => density::run_min(rule, layout, dbu_to_um, cache, merged),
-        "max_density"           => density::run_max(rule, layout, dbu_to_um, cache, merged),
-        "min_area"              => area::run_min(rule, layout, dbu_to_um, merged),
-        "must_interact"         => must_interact::run(rule, layout, dbu_to_um),
-        "nonempty"              => nonempty::run(rule, layout, dbu_to_um, merged),
-        "min_enclosed_area"     => min_enclosed_area::run(rule, layout, dbu_to_um, merged),
-        "max_area"              => area::run_max(rule, layout, dbu_to_um, merged),
-        "max_total_area"        => max_total_area::run(rule, layout, dbu_to_um, merged),
-        "no_angle"              => no_angle::run(rule, layout, dbu_to_um, merged),
-        "gate_length"           => gate_length::run(rule, layout, dbu_to_um, merged),
-        "min_region_density"    => min_region_density::run(rule, layout, dbu_to_um, merged),
-        "wide_uncovered"        => wide_uncovered::run(rule, layout, dbu_to_um, merged),
-        "no_ring"               => no_ring::run(rule, layout, dbu_to_um),
-        "min_enclosure"         => min_enclosure::run(rule, layout, dbu_to_um, merged),
-        "max_enclosure"         => max_enclosure::run(rule, layout, dbu_to_um, merged),
-        "min_endcap_enclosure"  => min_endcap_enclosure::run(rule, layout, dbu_to_um, merged),
-        "min_extension"         => min_extension::run(rule, layout, dbu_to_um, merged),
-        "min_notch"             => min_notch::run(rule, layout, dbu_to_um, merged),
-        "min_space"             => min_space::run(rule, layout, dbu_to_um, merged),
-        "min_space_different_net" => min_space_different_net::run(rule, layout, dbu_to_um, merged, conn),
-        "max_space"             => max_space::run(rule, layout, dbu_to_um, merged),
-        "min_space_bent"        => min_space_bent::run(rule, layout, dbu_to_um, merged),
-        "min_array_space"       => min_array_space::run(rule, layout, dbu_to_um, merged),
-        "min_space_prl"         => min_space_prl::run(rule, layout, dbu_to_um, merged),
-        "min_45_width"          => min_45_width::run(rule, layout, dbu_to_um, merged),
-        "min_width"             => min_width::run(rule, layout, dbu_to_um, merged),
-        "max_width"             => max_width::run(rule, layout, dbu_to_um, merged),
-        "min_windowed_density"  => windowed_density::run_min(rule, layout, dbu_to_um, merged),
-        "max_windowed_density"  => windowed_density::run_max(rule, layout, dbu_to_um, merged),
-        "offgrid"               => offgrid::run(rule, layout, dbu_to_um),
+    let mut out = match rule.check.as_str() {
+        // Width: the material between two walls of one region.
+        "min_width" => width::run(width::Kind::Min, rule, layout, dbu_to_um, merged),
+        "max_width" => width::run(width::Kind::Max, rule, layout, dbu_to_um, merged),
+        "exact_width" => width::run(width::Kind::Exact, rule, layout, dbu_to_um, merged),
+        "min_gate_length" => width::run_gate(width::Kind::Min, rule, layout, dbu_to_um, merged),
+        "max_gate_length" => width::run_gate(width::Kind::Max, rule, layout, dbu_to_um, merged),
+        "exact_gate_length" => width::run_gate(width::Kind::Exact, rule, layout, dbu_to_um, merged),
+        // Space: the gap between two regions, or two walls of one.
+        "min_space" => space::run_min(rule, layout, dbu_to_um, merged, conn),
+        "min_notch" => space::notch::run(rule, layout, dbu_to_um, merged),
+        "min_overlap" => space::run_min_overlap(rule, layout, dbu_to_um, merged),
+        "max_space" => space::max::run(rule, layout, dbu_to_um, merged),
+        // Enclosure: the margin of one region inside another.
+        "min_enclosure" => enclosure::run(enclosure::Kind::Min, rule, layout, dbu_to_um, merged),
+        "max_enclosure" => enclosure::run(enclosure::Kind::Max, rule, layout, dbu_to_um, merged),
+        // Shape: a region's own extents, edges, corners, holes and vertices.
+        "min_dim" => shape::extent::run(
+            shape::Kind::Min,
+            shape::extent::Axis::Short,
+            rule,
+            layout,
+            dbu_to_um,
+            merged,
+        ),
+        "max_dim" => shape::extent::run(
+            shape::Kind::Max,
+            shape::extent::Axis::Short,
+            rule,
+            layout,
+            dbu_to_um,
+            merged,
+        ),
+        "exact_dim" => shape::extent::run(
+            shape::Kind::Exact,
+            shape::extent::Axis::Short,
+            rule,
+            layout,
+            dbu_to_um,
+            merged,
+        ),
+        "min_length" => shape::extent::run(
+            shape::Kind::Min,
+            shape::extent::Axis::Long,
+            rule,
+            layout,
+            dbu_to_um,
+            merged,
+        ),
+        "max_length" => shape::extent::run(
+            shape::Kind::Max,
+            shape::extent::Axis::Long,
+            rule,
+            layout,
+            dbu_to_um,
+            merged,
+        ),
+        "exact_length" => shape::extent::run(
+            shape::Kind::Exact,
+            shape::extent::Axis::Long,
+            rule,
+            layout,
+            dbu_to_um,
+            merged,
+        ),
+        "min_edge_length" => {
+            shape::edge_length::run(shape::Kind::Min, rule, layout, dbu_to_um, merged)
+        }
+        "max_edge_length" => {
+            shape::edge_length::run(shape::Kind::Max, rule, layout, dbu_to_um, merged)
+        }
+        "exact_edge_length" => {
+            shape::edge_length::run(shape::Kind::Exact, rule, layout, dbu_to_um, merged)
+        }
+        "no_angle" => shape::angle::run(rule, layout, dbu_to_um, merged),
+        "no_corner" => shape::corner::run(rule, layout, dbu_to_um, merged),
+        "no_hole" => shape::holes::run(rule, layout, dbu_to_um, merged),
+        "no_ring" => shape::ring::run(rule, layout, dbu_to_um),
+        "ring_covers_boundary" => shape::ring_covers_boundary::run(rule, layout, dbu_to_um),
+        "max_vertices" => shape::vertices::run(rule, layout, dbu_to_um),
+        "offgrid" => shape::offgrid::run(rule, layout, dbu_to_um, merged),
+        "wide_uncovered" => shape::wide_uncovered::run(rule, layout, dbu_to_um, merged),
+        // Area: a region's area, per region, hole, containment or chip.
+        "min_area" => area::run(area::Kind::Min, rule, layout, dbu_to_um, merged, conn),
+        "max_area" => area::run(area::Kind::Max, rule, layout, dbu_to_um, merged, conn),
+        "exact_area" => area::run(area::Kind::Exact, rule, layout, dbu_to_um, merged, conn),
+        "min_count" => count::run(count::Kind::Min, rule, layout, dbu_to_um, merged),
+        "max_count" => count::run(count::Kind::Max, rule, layout, dbu_to_um, merged),
+        "exact_count" => count::run(count::Kind::Exact, rule, layout, dbu_to_um, merged),
+        // Density: the coverage of layers over the chip, a window or a region.
+        "min_density" => density::run(density::Kind::Min, rule, layout, dbu_to_um, merged),
+        "max_density" => density::run(density::Kind::Max, rule, layout, dbu_to_um, merged),
+        // Net: what only the connect graph can answer.
+        "antenna_ratio" => net::antenna::run(rule, layout, dbu_to_um, merged, conn),
+        "max_nets_under" => net::nets_under::run(rule, layout, dbu_to_um, merged, conn),
+        // Residual: what a rule forbids outright.
+        "forbidden" => residual::run(rule, layout, dbu_to_um, merged),
         other => {
             eprintln!("[{}] Unknown check function: '{}'", rule.id, other);
             vec![]
         }
+    };
+    // `layer_params: {interacting: X}` keeps only the violations that touch X - KLayout's
+    // trailing `.interacting(layer)` on a check's result.  GF180's CUP.2 measures the
+    // width of the metal connected to a bond pad, but only where the measurement meets
+    // the pad: a millimetre of 0.3 µm line that happens to be on the pad's net is the
+    // line's own business.
+    if let (Some(l), Some(d)) = (rule.num("interacting"), rule.num("interacting_dt")) {
+        let key = (l as i16, d as i16);
+        merged.ensure(layout, key.0, key.1);
+        let tiles_arc = merged.tiles(key.0, key.1);
+        let tiles = &*tiles_arc;
+        let t = merged.tile_dbu() as f64 * dbu_to_um;
+        let touches = |x: f64, y: f64| {
+            let tile = ((x / t).floor() as i32, (y / t).floor() as i32);
+            let (xd, yd) = (x / dbu_to_um, y / dbu_to_um);
+            tiles
+                .get(&tile)
+                .is_some_and(|ps| ps.iter().any(|p| crate::merge::point_in_merged(xd, yd, p)))
+        };
+        // A marker is a segment, and it meets the layer where any part of it does: a
+        // wall sampled at five points along it missed a six-micron pad on a thirty-five
+        // micron line, so a narrow line under a bond pad went unreported as soon as it
+        // ran far enough past the pad (report, cup finding 1).  Read tile by tile over
+        // the segment's own box, each polygon against the whole segment.
+        let meets = |x1: f64, y1: f64, x2: f64, y2: f64| {
+            let e = crate::merge::Edge {
+                a: crate::merge::IntPoint::new(
+                    (x1 / dbu_to_um).round() as i32,
+                    (y1 / dbu_to_um).round() as i32,
+                ),
+                b: crate::merge::IntPoint::new(
+                    (x2 / dbu_to_um).round() as i32,
+                    (y2 / dbu_to_um).round() as i32,
+                ),
+            };
+            let (tx0, tx1) = (
+                (x1.min(x2) / t).floor() as i32,
+                (x1.max(x2) / t).floor() as i32,
+            );
+            let (ty0, ty1) = (
+                (y1.min(y2) / t).floor() as i32,
+                (y1.max(y2) / t).floor() as i32,
+            );
+            (ty0..=ty1).any(|ty| {
+                (tx0..=tx1).any(|tx| {
+                    tiles
+                        .get(&(tx, ty))
+                        .is_some_and(|ps| ps.iter().any(|p| crate::merge::poly_meets_edge(p, &e)))
+                })
+            })
+        };
+        let trace = std::env::var("GDSCHECK_RULE_TRACE").is_ok();
+        out.retain(|v| {
+            let keep = match v.geometry {
+                crate::violation::ViolationGeometry::Point { x, y } => touches(x, y),
+                crate::violation::ViolationGeometry::Edge { x1, y1, x2, y2 } => {
+                    meets(x1, y1, x2, y2)
+                }
+                crate::violation::ViolationGeometry::None => true,
+            };
+            if !keep && trace {
+                eprintln!(
+                    "dropped (not interacting {}/{}): {}",
+                    key.0, key.1, v.message
+                );
+            }
+            keep
+        });
     }
+    out
 }

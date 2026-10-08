@@ -12,6 +12,11 @@ default:
 test:
     cargo test --release
 
+# The suite at a 7 µm tile: a result that holds at 20 and not at 7 depends on where
+# the tile lines fall, which no result may.
+test-tile:
+    GDSCHECK_TILE_UM=7 cargo test --release
+
 # Lint with clippy, warnings as errors.
 clippy:
     cargo clippy --release -- -D warnings
@@ -20,9 +25,16 @@ clippy:
 build:
     cargo build --release
 
-# Regenerate the IHP SG13G2 test fixtures from the generators.
-gen-testdata:
-    cargo run --release --features dev-tools --bin gen-testdata -- --pdk pdks/ihp-sg13g2/pdk.yml
+# Regenerate every PDK's generated test fixtures.
+gen-testdata: (gen-testdata-for "ihp-sg13g2") (gen-testdata-for "gf180mcuD")
+
+# Regenerate one PDK's generated test fixtures.
+gen-testdata-for pdk:
+    cargo run --release --features dev-tools --bin gen-testdata -- --pdk pdks/{{pdk}}/pdk.yml
+
+# Run the main suite over the reference designs of one PDK (needs ../reference-designs).
+designs process="ihp-sg13g2":
+    ci/run-designs.sh {{process}}
 
 # Format, lint, and test — the pre-commit gate.
 check: clippy test

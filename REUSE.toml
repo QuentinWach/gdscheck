@@ -8,10 +8,25 @@ SPDX-FileCopyrightText = "2026 aesc silicon"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
-path = "tests/data/*/*gds.gz"
+path = "Cargo.lock"
 SPDX-FileCopyrightText = "2026 aesc silicon"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
+[[annotations]]
+path = "docs/**"
+SPDX-FileCopyrightText = "2026 aesc silicon"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "images/**"
+SPDX-FileCopyrightText = "2026 aesc silicon"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+
+[[annotations]]
+path = "tests/data/*/*gds.gz"
+SPDX-FileCopyrightText = "2026 aesc silicon"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
 path = "tests/data/*/*/*gds.gz"
@@ -24,11 +39,18 @@ SPDX-FileCopyrightText = "2026 aesc silicon"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
-path = "Cargo.lock"
-SPDX-FileCopyrightText = "2026 aesc silicon"
-SPDX-License-Identifier = "AGPL-3.0-or-later"
+# DRC test cases from the GF180MCU PDK (libs.tech/klayout/tech/drc/testing/unit),
+# vendored unchanged apart from gzip - except nplus and pplus, where four TEXT
+# elements carrying a zero-length label were removed from each so gds21 can read the
+# file at all (its read_str underflows on an empty string). No geometry was touched.  Listed after the generic tests/data globs so
+# this more specific entry takes precedence over them.
+path = "tests/data/gf180mcuD/static/*.gds.gz"
+SPDX-FileCopyrightText = "2023 GlobalFoundries PDK Authors"
+SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
-path = "docs/**"
+# Everything under generated/ is drawn here rather than vendored: a good and a bad
+# pattern per rule, written by gen/gf180mcuD/.
+path = ["tests/data/gf180mcuD/generated/*.gds.gz", "tests/data/gf180mcuD/generated/**/*.gds.gz"]
 SPDX-FileCopyrightText = "2026 aesc silicon"
 SPDX-License-Identifier = "AGPL-3.0-or-later"

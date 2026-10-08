@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: 2026 aesc silicon
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# The same 0.5 µm enclosure under both metrics, so a pattern says which of them a
+# given geometry reaches.  They agree on orthogonal walls and part company at any
+# corner that is not square, which is the whole reason this deck exists.
+rules:
+  - id: ENC.proj
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      metric: projection
+  - id: ENC.eucl
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      metric: euclidian
+  # KLayout drops a pair measuring exactly zero - a corner resting on the enclosing
+  # wall - before it reports.  `skip_coincident` is meant to mirror that, and the
+  # `touch` patterns say whether it drops only those.
+  - id: ENC.eucl_skip
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      skip_coincident: 1
+      metric: euclidian
+  # The other bound, and each `sides` word once: the endcap under both bounds, the
+  # bordering sides of a short one, the cap of a narrow track, and the extension - the
+  # margin on the walls a cover crosses - under both bounds.
+  - id: ENC.max
+    check: max_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+  - id: ENC.any
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      sides: any
+  - id: ENC.max_any
+    check: max_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      sides: any
+  - id: ENC.adj
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      sides: adjacent
+      trigger: 0.1
+  - id: ENC.cap
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.3
+    params:
+      sides: line_end
+      max_width: 0.34
+      min_length: 0.5
+  - id: ENC.ext
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      interacting_only: 1
+  - id: ENC.ext_eucl
+    check: min_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      interacting_only: 1
+      metric: euclidian
+  - id: ENC.max_ext
+    check: max_enclosure
+    layers: [Outer, Inner]
+    value: 0.5
+    params:
+      interacting_only: 1
